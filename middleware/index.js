@@ -1,5 +1,6 @@
 require('dotenv').config();
 const mqtt = require('mqtt');
+require('./ocpp'); // Start OCPP WebSocket server
 
 // MQTT connection
 const client = mqtt.connect('mqtt://localhost:1883', {
@@ -52,7 +53,6 @@ const activeSessions = {};
 function checkForFault(deviceId, watts) {
   if (!activeSessions[deviceId]) return;
   const session = activeSessions[deviceId];
-
   if (watts === 0) {
     if (!session.faultStart) {
       session.faultStart = Date.now();
@@ -86,5 +86,4 @@ function stopCharging(deviceId) {
 }
 
 module.exports = { startCharging, stopCharging };
-
 console.log('[EVFLO] Middleware starting...');
