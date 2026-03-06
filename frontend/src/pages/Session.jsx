@@ -2,31 +2,59 @@ import { useState, useEffect } from 'react';
 import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import Logo from '../components/Logo';
 
+const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+const POLL_INTERVAL = 3000; // ms
+
 export default function Session() {
   const navigate = useNavigate();
   const { chargePointId } = useParams();
   const { state } = useLocation();
-  const email = state?.email || 'guest';
+  const sessionId  = state?.sessionId;
+  const email      = state?.email || 'guest';
+  const ratePerKwh = state?.ratePerKwh || '0.45';
 
-  const [kwh, setKwh] = useState(0);
-  const [watts, setWatts] = useState(0);
+  const [kwh, setKwh]       = useState(0);
+  const [watts, setWatts]   = useState(0);
+  const [cost, setCost]     = useState(0);
   const [elapsed, setElapsed] = useState(0);
-  const [cost, setCost] = useState(0);
-  const RATE = 0.45;
+  const [error, setError]   = useState('');
 
+  // Elapsed timer
   useEffect(() => {
-    const interval = setInterval(() => {
-      setElapsed(prev => prev + 1);
-      const simulatedWatts = 2200 + (Math.random() * 200 - 100);
-      setWatts(Math.round(simulatedWatts));
-      setKwh(prev => {
-        const newKwh = prev + simulatedWatts / 3600000;
-        setCost(newKwh * RATE);
-        return newKwh;
-      });
-    }, 1000);
-    return () => clearInterval(interval);
+    const timer = setInterval(() => setElapsed(prev => prev + 1), 1000);
+    return () => clearInterval(timer);
   }, []);
+
+  // Poll API for live kWh and power
+  useEffect(() => {
+    if (!sessionId) return;
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${API}/api/sessions/${sessionId}`);
+        if (!res.ok) return;
+        const data = await res.json();
+
+        setKwh(data.kwhConsumed);
+        setWatts(data.powerWatts);
+        setCost(parseFloat(data.runningCostAud));
+
+        // If session was stopped server-side (fault/timeout), redirect
+        if (data.status === 'completed') {
+          navigate(`/stop/${chargePointId}`, {
+            state: { sessionId, email, kwh: data.kwhConsumed, cost: parseFloat(data.runningCostAud), elapsed }
+          });
+        }
+      } catch (err) {
+        // Non-fatal — just log, keep showing last known values
+        console.error('[SESSION] Poll error:', err.message);
+      }
+    };
+
+    poll(); // immediate first call
+    const interval = setInterval(poll, POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [sessionId]);
 
   const formatTime = (seconds) => {
     const h = Math.floor(seconds / 3600);
@@ -39,7 +67,7 @@ export default function Session() {
 
   const handleStop = () => {
     navigate(`/stop/${chargePointId}`, {
-      state: { email, kwh, cost, elapsed, watts }
+      state: { sessionId, email, kwh, cost, elapsed }
     });
   };
 
@@ -59,6 +87,8 @@ export default function Session() {
             <h2 className="heading-md" style={{ marginBottom: '4px' }}>Charging</h2>
             <p style={{ fontSize: '0.85rem', color: 'var(--cream-dim)' }}>{chargePointId} · {email}</p>
           </div>
+
+          {error && <div className="error-msg">{error}</div>}
 
           <div className="session-meter fade-up-2">
             <div className="meter-row">
@@ -83,8 +113,8 @@ export default function Session() {
           </div>
 
           <div className="fade-up-3" style={{ fontSize: '0.8rem', color: 'var(--cream-dim)', lineHeight: 1.6, textAlign: 'center' }}>
-            Your vehicle is charging at <strong style={{ color: 'var(--cream)' }}>{(watts/1000).toFixed(1)} kW</strong>.<br />
-            Rate: $0.45 per kWh
+            Your vehicle is charging at <strong style={{ color: 'var(--cream)' }}>{(watts / 1000).toFixed(1)} kW</strong>.<br />
+            Rate: ${ratePerKwh} per kWh
           </div>
         </div>
 

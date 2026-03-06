@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import Logo from '../components/Logo';
 
+const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
+
 export default function Start() {
   const navigate = useNavigate();
   const { chargePointId } = useParams();
@@ -17,11 +19,30 @@ export default function Start() {
     setError('');
     setLoading(true);
 
-    // TODO: wire to API - for now simulate session start
-    setTimeout(() => {
+    try {
+      const res = await fetch(`${API}/api/sessions/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chargePointId, email })
+      });
+
+      const data = await res.json();
+
+      if (!res.ok) {
+        setError(data.error || 'Failed to start session');
+        setLoading(false);
+        return;
+      }
+
+      // Pass sessionId and email to Session screen
+      navigate(`/session/${chargePointId}`, {
+        state: { sessionId: data.sessionId, email, ratePerKwh: data.ratePerKwh }
+      });
+
+    } catch (err) {
+      setError('Could not connect to server. Please try again.');
       setLoading(false);
-      navigate(`/session/${chargePointId}`, { state: { email } });
-    }, 1200);
+    }
   };
 
   return (
@@ -68,11 +89,7 @@ export default function Start() {
         </div>
 
         <div className="fade-up-4" style={{ display: 'flex', flexDirection: 'column', gap: '12px', paddingTop: '32px' }}>
-          <button
-            className="btn-primary"
-            onClick={handleStart}
-            disabled={loading}
-          >
+          <button className="btn-primary" onClick={handleStart} disabled={loading}>
             {loading ? 'Starting...' : 'Begin Charging ›'}
           </button>
           <button className="btn-secondary" onClick={() => navigate(-1)}>
