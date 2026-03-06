@@ -60,13 +60,13 @@ app.get('/api/charger/:chargePointId', async (req, res) => {
     const { data: cp, error } = await supabase
       .from('charge_points')
       .select(`
-        id, identifier, status,
+        id, device_id, status,
         sites (
-          id, name, address, site_type,
+          id, name, address, ,
           site_host_rate_per_kwh, evflo_fee_per_kwh, currency
         )
       `)
-      .eq('id', chargePointId)
+      .eq('device_id', chargePointId)
       .single();
 
     if (error || !cp) return res.status(404).json({ error: 'Charger not found' });
@@ -80,7 +80,7 @@ app.get('/api/charger/:chargePointId', async (req, res) => {
 
     res.json({
       chargePointId: cp.id,
-      identifier:    cp.identifier,
+      device_id:    cp.device_id,
       siteName:      site.name,
       siteAddress:   site.address,
       siteId:        site.id,
@@ -107,8 +107,8 @@ app.post('/api/sessions/start', async (req, res) => {
     // Get charger + site rates
     const { data: cp, error: cpError } = await supabase
       .from('charge_points')
-      .select(`id, identifier, status, sites ( id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency )`)
-      .eq('id', chargePointId)
+      .select(`id, device_id, status, sites ( id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency )`)
+      .eq('device_id', chargePointId)
       .single();
 
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
@@ -169,12 +169,12 @@ app.post('/api/sessions/start', async (req, res) => {
     if (sessionError) throw new Error(`Session create failed: ${sessionError.message}`);
 
     // Mark charger occupied
-    await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', chargePointId);
+    await supabase.from('charge_points').update({ status: 'occupied' }).eq('device_id', chargePointId);
 
     // Relay ON
     if (mqttClient) {
-      mqttClient.publish(`shellies/${cp.identifier}/relay/0/command`, 'on');
-      console.log(`[API] Relay ON → ${cp.identifier}`);
+      mqttClient.publish(`shellies/${cp.device_id}/relay/0/command`, 'on');
+      console.log(`[API] Relay ON → ${cp.device_id}`);
     }
 
     const ratePerKwh = (parseFloat(cp.sites.site_host_rate_per_kwh) + parseFloat(cp.sites.evflo_fee_per_kwh)).toFixed(2);
@@ -198,7 +198,7 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
       .from('sessions')
       .select(`
         id, status, start_kwh_reading, final_kwh_reading, started_at, ended_at,
-        charge_points ( identifier, sites ( name, site_host_rate_per_kwh, evflo_fee_per_kwh, currency ) )
+        charge_points ( device_id, sites ( name, site_host_rate_per_kwh, evflo_fee_per_kwh, currency ) )
       `)
       .eq('id', req.params.sessionId)
       .single();
@@ -250,7 +250,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
       .from('sessions')
       .select(`
         id, user_id, status, start_kwh_reading, stripe_payment_intent_id,
-        charge_points ( id, identifier, sites ( id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency ) )
+        charge_points ( id, device_id, sites ( id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency ) )
       `)
       .eq('id', sessionId)
       .single();
@@ -263,8 +263,8 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
 
     // Relay OFF
     if (mqttClient) {
-      mqttClient.publish(`shellies/${cp.identifier}/relay/0/command`, 'off');
-      console.log(`[API] Relay OFF → ${cp.identifier}`);
+      mqttClient.publish(`shellies/${cp.device_id}/relay/0/command`, 'off');
+      console.log(`[API] Relay OFF → ${cp.device_id}`);
     }
 
     // Final kWh
