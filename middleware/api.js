@@ -17,7 +17,8 @@ app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', meth
 app.use(express.json());
 
 let mqttClient = null;
-function setMqttClient(client, deviceMap) { mqttClient = client; }
+let deviceStateCache = {};
+function setMqttClient(client, deviceMap, deviceState) { mqttClient = client; deviceStateCache = deviceState || {}; }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', stripe: STRIPE_ENABLED }));
 
@@ -50,7 +51,7 @@ app.post('/api/sessions/start', async (req, res) => {
       .upsert({ email }, { onConflict: 'email' }).select('id, stripe_customer_id').single();
     if (userError) throw new Error('User upsert failed: ' + userError.message);
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString() })
+      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[chargePointId] ? deviceStateCache[chargePointId].kwh : 0 })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
@@ -81,7 +82,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .select('id, user_id, status, rate_per_kwh, evflo_margin, stripe_payment_intent_id, charge_points(id, device_id, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
+      .select('id, user_id, status, rate_per_kwh, evflo_margin, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
       .eq('id', sessionId).single();
     if (sessionError || !session) return res.status(404).json({ error: 'Session not found' });
     if (session.status !== 'active') return res.status(409).json({ error: 'Session is ' + session.status });
@@ -89,8 +90,10 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     const site = cp.sites;
     if (mqttClient) { mqttClient.publish('shelly1pmg4-' + cp.device_id + '/command/switch:0', 'off'); console.log('[API] Relay OFF → ' + cp.device_id); }
     const { data: finalTelemetry } = await supabase.from('session_telemetry')
-      .select('kwh_reading').eq('session_id', sessionId).order('timestamp', { ascending: false }).limit(1).single();
-    const kwhConsumed = parseFloat((finalTelemetry?.kwh_reading ?? 0).toFixed(4));
+      .select('kwh_total').eq('session_id', sessionId).order('recorded_at', { ascending: false }).limit(1).single();
+    const finalKwh = finalTelemetry?.kwh_total ?? 0;
+    const startKwh = parseFloat(session.start_kwh_reading ?? 0);
+    const kwhConsumed = parseFloat((finalKwh - startKwh).toFixed(4));
     await supabase.from('sessions').update({ status: 'completed', kwh_consumed: kwhConsumed, stopped_at: new Date().toISOString() }).eq('id', sessionId);
     await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
     const ratePerKwh = parseFloat(session.rate_per_kwh);
@@ -102,7 +105,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     let transactionId = null;
     if (kwhConsumed > 0) {
       const { data: txn, error: txnError } = await supabase.from('transactions')
-        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_charge_status: 'skipped', metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2) } })
+        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_charge_status: 'pending', metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2) } })
         .select('id').single();
       if (txnError) console.error('[API] Transaction insert failed:', txnError.message);
       else transactionId = txn.id;
