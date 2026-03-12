@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -13,7 +14,7 @@ if (STRIPE_ENABLED) {
 }
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:5173', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(express.json());
 
 let mqttClient = null;
@@ -51,7 +52,7 @@ app.post('/api/sessions/start', async (req, res) => {
       .upsert({ email }, { onConflict: 'email' }).select('id, stripe_customer_id').single();
     if (userError) throw new Error('User upsert failed: ' + userError.message);
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[chargePointId] ? deviceStateCache[chargePointId].kwh : 0 })
+      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0 })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
@@ -93,8 +94,8 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
       .select('kwh_total').eq('session_id', sessionId).order('recorded_at', { ascending: false }).limit(1).single();
     const finalKwh = finalTelemetry?.kwh_total ?? 0;
     const startKwh = parseFloat(session.start_kwh_reading ?? 0);
-    const kwhConsumed = parseFloat((finalKwh - startKwh).toFixed(4));
-    await supabase.from('sessions').update({ status: 'completed', kwh_consumed: kwhConsumed, stopped_at: new Date().toISOString() }).eq('id', sessionId);
+    const kwhConsumed = parseFloat(Math.max(0, finalKwh - startKwh).toFixed(4));
+    await supabase.from('sessions').update({ status: 'completed', kwh_consumed: kwhConsumed, final_kwh_reading: finalKwh, stopped_at: new Date().toISOString() }).eq('id', sessionId);
     await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
     const ratePerKwh = parseFloat(session.rate_per_kwh);
     const siteHostRate = parseFloat(site.site_host_rate_per_kwh);
