@@ -69,8 +69,8 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
       .eq('id', req.params.sessionId).single();
     if (error || !session) return res.status(404).json({ error: 'Session not found' });
     const { data: telemetry } = await supabase.from('session_telemetry')
-      .select('kwh_reading, power_watts').eq('session_id', req.params.sessionId)
-      .order('timestamp', { ascending: false }).limit(1).single();
+      .select('kwh_total, watts').eq('session_id', req.params.sessionId)
+      .order('recorded_at', { ascending: false }).limit(1).single();
     const site = session.charge_points?.sites;
     const ratePerKwh = parseFloat(session.rate_per_kwh) || 0;
     const kwhConsumed = telemetry?.kwh_total ?? parseFloat(session.kwh_consumed) ?? 0;
