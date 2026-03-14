@@ -73,9 +73,9 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
       .order('timestamp', { ascending: false }).limit(1).single();
     const site = session.charge_points?.sites;
     const ratePerKwh = parseFloat(session.rate_per_kwh) || 0;
-    const kwhConsumed = telemetry?.kwh_reading ?? parseFloat(session.kwh_consumed) ?? 0;
+    const kwhConsumed = telemetry?.kwh_total ?? parseFloat(session.kwh_consumed) ?? 0;
     const runningCostCents = Math.round(kwhConsumed * ratePerKwh * 100);
-    res.json({ sessionId: session.id, status: session.status, siteName: site?.name || '', kwhConsumed: parseFloat(kwhConsumed.toFixed(4)), powerWatts: telemetry?.power_watts ?? 0, runningCostCents, runningCostAud: (runningCostCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), currency: site?.currency || 'AUD', startedAt: session.started_at, endedAt: session.stopped_at ?? null });
+    res.json({ sessionId: session.id, status: session.status, siteName: site?.name || '', kwhConsumed: parseFloat(kwhConsumed.toFixed(4)), powerWatts: telemetry?.watts ?? 0, runningCostCents, runningCostAud: (runningCostCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), currency: site?.currency || 'AUD', startedAt: session.started_at, endedAt: session.stopped_at ?? null });
   } catch (err) { console.error('[API] GET /sessions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
