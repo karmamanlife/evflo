@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
@@ -13,8 +12,10 @@ if (STRIPE_ENABLED) {
   console.log('[API] Stripe not configured — add STRIPE_SECRET_KEY to .env when ready');
 }
 
+const PRE_AUTH_AMOUNT_CENTS = parseInt(process.env.PRE_AUTH_AMOUNT_CENTS || '2500');
+
 const app = express();
-app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
+app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'x-admin-key'] }));
 app.use(express.json());
 
 let mqttClient = null;
@@ -36,15 +37,40 @@ app.get('/api/charger/:chargePointId', async (req, res) => {
   } catch (err) { console.error('[API] GET /charger error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
+app.post('/api/sessions/create-payment-intent', async (req, res) => {
+  try {
+    if (!STRIPE_ENABLED) return res.status(503).json({ error: 'Stripe not configured' });
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'email required' });
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: PRE_AUTH_AMOUNT_CENTS,
+      currency: 'aud',
+      capture_method: 'manual',
+      description: 'EVFLO charging session pre-authorisation',
+      metadata: { email }
+    });
+    console.log('[API] PaymentIntent created: ' + paymentIntent.id + ' — $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' hold');
+    res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
+  } catch (err) { console.error('[API] create-payment-intent error:', err.message); res.status(500).json({ error: 'Failed to create payment intent' }); }
+});
+
 app.post('/api/sessions/start', async (req, res) => {
   try {
-    const { chargePointId, email } = req.body;
+    const { chargePointId, email, paymentIntentId } = req.body;
     if (!chargePointId || !email) return res.status(400).json({ error: 'chargePointId and email required' });
+    if (STRIPE_ENABLED && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
     const { data: cp, error: cpError } = await supabase.from('charge_points')
       .select('id, device_id, status, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
       .eq('device_id', chargePointId).single();
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
+    if (STRIPE_ENABLED) {
+      const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+      if (pi.status !== 'requires_capture') {
+        console.error('[API] PaymentIntent not confirmed — status: ' + pi.status);
+        return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
+      }
+    }
     const site = cp.sites;
     const ratePerKwh = parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh);
     const evfloMargin = parseFloat(site.evflo_fee_per_kwh);
@@ -52,12 +78,12 @@ app.post('/api/sessions/start', async (req, res) => {
       .upsert({ email }, { onConflict: 'email' }).select('id, stripe_customer_id').single();
     if (userError) throw new Error('User upsert failed: ' + userError.message);
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0 })
+      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0, stripe_payment_intent_id: paymentIntentId || null })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
     if (mqttClient) { mqttClient.publish('shelly1pmg4-' + cp.device_id + '/command/switch:0', 'on'); console.log('[API] Relay ON → ' + cp.device_id); }
-    console.log('[API] Session started: ' + session.id);
+    console.log('[API] Session started: ' + session.id + ' — PI: ' + (paymentIntentId || 'none'));
     res.json({ sessionId: session.id, status: 'active', startedAt: new Date().toISOString(), ratePerKwh: ratePerKwh.toFixed(2) });
   } catch (err) { console.error('[API] POST /sessions/start error:', err.message); res.status(500).json({ error: 'Failed to start session' }); }
 });
@@ -65,7 +91,7 @@ app.post('/api/sessions/start', async (req, res) => {
 app.get('/api/sessions/:sessionId', async (req, res) => {
   try {
     const { data: session, error } = await supabase.from('sessions')
-      .select('id, status, kwh_consumed, rate_per_kwh, started_at, stopped_at, charge_points(device_id, sites(name, currency))')
+      .select('id, status, kwh_consumed, rate_per_kwh, start_kwh_reading, started_at, stopped_at, charge_points(device_id, sites(name, currency))')
       .eq('id', req.params.sessionId).single();
     if (error || !session) return res.status(404).json({ error: 'Session not found' });
     const { data: telemetry } = await supabase.from('session_telemetry')
@@ -73,7 +99,9 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
       .order('recorded_at', { ascending: false }).limit(1).single();
     const site = session.charge_points?.sites;
     const ratePerKwh = parseFloat(session.rate_per_kwh) || 0;
-    const kwhConsumed = telemetry?.kwh_total ?? parseFloat(session.kwh_consumed) ?? 0;
+    const startKwh = parseFloat(session.start_kwh_reading ?? 0);
+    const rawKwh = telemetry?.kwh_total ?? startKwh;
+    const kwhConsumed = session.status === 'completed' ? parseFloat(session.kwh_consumed ?? 0) : parseFloat(Math.max(0, rawKwh - startKwh).toFixed(4));
     const runningCostCents = Math.round(kwhConsumed * ratePerKwh * 100);
     res.json({ sessionId: session.id, status: session.status, siteName: site?.name || '', kwhConsumed: parseFloat(kwhConsumed.toFixed(4)), powerWatts: telemetry?.watts ?? 0, runningCostCents, runningCostAud: (runningCostCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), currency: site?.currency || 'AUD', startedAt: session.started_at, endedAt: session.stopped_at ?? null });
   } catch (err) { console.error('[API] GET /sessions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
@@ -103,16 +131,40 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     const totalCents = Math.round(kwhConsumed * ratePerKwh * 100);
     const siteHostCents = Math.round(kwhConsumed * siteHostRate * 100);
     const evfloFeeCents = totalCents - siteHostCents;
+    let stripeChargeStatus = 'pending';
     let transactionId = null;
     if (kwhConsumed > 0) {
+      if (STRIPE_ENABLED && session.stripe_payment_intent_id) {
+        try {
+          if (totalCents >= 50) {
+            await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: totalCents });
+            stripeChargeStatus = 'succeeded';
+            console.log('[API] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (totalCents / 100).toFixed(2));
+          } else {
+            await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
+            stripeChargeStatus = 'cancelled';
+            console.log('[API] Stripe cancelled (amount < $0.50): ' + session.stripe_payment_intent_id);
+          }
+        } catch (stripeErr) {
+          stripeChargeStatus = 'failed';
+          console.error('[API] Stripe capture failed:', stripeErr.message);
+        }
+      }
       const { data: txn, error: txnError } = await supabase.from('transactions')
-        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_charge_status: 'pending', metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2) } })
+        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_payment_intent_id: session.stripe_payment_intent_id, stripe_charge_status: stripeChargeStatus, metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2) } })
         .select('id').single();
       if (txnError) console.error('[API] Transaction insert failed:', txnError.message);
       else transactionId = txn.id;
+    } else {
+      if (STRIPE_ENABLED && session.stripe_payment_intent_id) {
+        try {
+          await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
+          console.log('[API] Stripe cancelled — 0 kWh session: ' + session.stripe_payment_intent_id);
+        } catch (stripeErr) { console.error('[API] Stripe cancel failed:', stripeErr.message); }
+      }
     }
-    console.log('[API] Session stopped: ' + sessionId + ' — ' + kwhConsumed + ' kWh — $' + (totalCents / 100).toFixed(2));
-    res.json({ sessionId, status: 'completed', kwhConsumed, totalAmountCents: totalCents, totalAmountAud: (totalCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), transactionId, currency: 'AUD' });
+    console.log('[API] Session stopped: ' + sessionId + ' — ' + kwhConsumed + ' kWh — $' + (totalCents / 100).toFixed(2) + ' — Stripe: ' + stripeChargeStatus);
+    res.json({ sessionId, status: 'completed', kwhConsumed, totalAmountCents: totalCents, totalAmountAud: (totalCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), transactionId, currency: 'AUD', stripeStatus: stripeChargeStatus });
   } catch (err) { console.error('[API] POST /sessions/stop error:', err.message); res.status(500).json({ error: 'Failed to stop session' }); }
 });
 
@@ -127,3 +179,46 @@ app.get('/api/transactions/:transactionId', async (req, res) => {
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log('[API] Server listening on port ' + PORT));
 module.exports = { app, setMqttClient };
+
+// ─── Admin endpoints ───────────────────────────────────────────────────────────
+const adminAuth = (req, res, next) => {
+  if (req.headers['x-admin-key'] !== 'EVFLO#2026') {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  next();
+};
+
+app.get('/api/admin/sites', adminAuth, async (req, res) => {
+  const { data, error } = await supabase.from('sites').select('*').order('created_at');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.get('/api/admin/sites/:siteId/charge-points', adminAuth, async (req, res) => {
+  const { data, error } = await supabase.from('charge_points').select('*').eq('site_id', req.params.siteId).order('created_at');
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/admin/charge-points', adminAuth, async (req, res) => {
+  const { siteId, deviceId, label } = req.body;
+  if (!siteId || !deviceId) return res.status(400).json({ error: 'siteId and deviceId are required' });
+  const { data, error } = await supabase.from('charge_points').insert({ site_id: siteId, device_id: deviceId, label: label || null, status: 'available' }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
+
+app.post('/api/admin/sites', adminAuth, async (req, res) => {
+  const { name, address, type, siteHostRatePerKwh, evfloFeePerKwh } = req.body;
+  if (!name || !type) return res.status(400).json({ error: 'name and type are required' });
+  const { data, error } = await supabase.from('sites').insert({
+    name,
+    address: address || null,
+    type,
+    site_host_rate_per_kwh: siteHostRatePerKwh || 0.35,
+    evflo_fee_per_kwh: evfloFeePerKwh || 0.10,
+    currency: 'AUD'
+  }).select().single();
+  if (error) return res.status(500).json({ error: error.message });
+  res.json(data);
+});
