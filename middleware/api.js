@@ -15,7 +15,7 @@ if (STRIPE_ENABLED) {
 const PRE_AUTH_AMOUNT_CENTS = parseInt(process.env.PRE_AUTH_AMOUNT_CENTS || '2500');
 
 const app = express();
-app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'x-admin-key'] }));
+app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'x-admin-key', 'Authorization'] }));
 app.use(express.json());
 
 let mqttClient = null;
@@ -174,6 +174,101 @@ app.get('/api/transactions/:transactionId', async (req, res) => {
     if (error || !txn) return res.status(404).json({ error: 'Transaction not found' });
     res.json({ transactionId: txn.id, kwhConsumed: txn.kwh_consumed, ratePerKwh: (parseFloat(txn.site_host_rate_per_kwh) + parseFloat(txn.evflo_fee_per_kwh)).toFixed(2), totalAmountCents: txn.total_amount_cents, totalAmountAud: (txn.total_amount_cents / 100).toFixed(2), currency: txn.currency, status: txn.stripe_charge_status, createdAt: txn.created_at, metadata: txn.metadata });
   } catch (err) { console.error('[API] GET /transactions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+
+// ─── F14 Auth endpoints ────────────────────────────────────────────────────────
+// POST /api/auth/send-magic-link
+app.post('/api/auth/send-magic-link', async (req, res) => {
+  try {
+    const { email, chargePointId } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { data: user } = await supabase.from('users').select('id, has_saved_card').eq('email', email.toLowerCase()).single();
+    if (!user || !user.has_saved_card) return res.status(400).json({ error: 'No saved card for this email' });
+    const { data: recentTokens } = await supabase.from('auth_tokens').select('id').eq('user_id', user.id).gte('created_at', new Date(Date.now() - 60 * 60 * 1000).toISOString());
+    if (recentTokens && recentTokens.length >= 3) return res.status(429).json({ error: 'Too many magic links requested. Please wait before trying again.' });
+    const crypto = require('crypto');
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    await supabase.from('auth_tokens').insert({ user_id: user.id, token, charge_point_id: chargePointId || null, expires_at: expiresAt });
+    const { Resend } = require('resend');
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const magicLink = 'https://evflo.com.au/auth/verify?token=' + token;
+    await resend.emails.send({
+      from: 'EVFLO <noreply@evflo.com.au>',
+      to: email,
+      subject: 'EVFLO — Tap to start charging',
+      html: '<p>Hi,</p><p>Tap the link below to start your charging session. This link expires in 15 minutes.</p><p><a href="' + magicLink + '" style="background:#22c55e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;">Start Charging</a></p><p>If you did not request this, ignore this email.</p>'
+    });
+    console.log('[API] Magic link sent to', email);
+    res.json({ sent: true });
+  } catch (err) { console.error('[API] send-magic-link error:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/auth/verify
+app.get('/api/auth/verify', async (req, res) => {
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+    const { data: authToken, error } = await supabase.from('auth_tokens').select('*, user:users(id, email, stripe_default_pm)').eq('token', token).single();
+    if (error || !authToken) return res.status(401).json({ error: 'Invalid token' });
+    if (authToken.used) return res.status(401).json({ error: 'Token already used' });
+    if (new Date(authToken.expires_at) < new Date()) return res.status(401).json({ error: 'Token expired' });
+    await supabase.from('auth_tokens').update({ used: true }).eq('id', authToken.id);
+    const jwt = require('jsonwebtoken');
+    const jwtToken = jwt.sign({ userId: authToken.user.id, email: authToken.user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    const pmId = authToken.user.stripe_default_pm;
+    let last4 = null;
+    if (pmId && STRIPE_ENABLED) {
+      try {
+        const pm = await stripe.paymentMethods.retrieve(pmId);
+        last4 = pm.card ? pm.card.last4 : null;
+      } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
+    }
+    const chargePointId = authToken.charge_point_id;
+    const redirectUrl = 'https://evflo.com.au/charger/' + (chargePointId ? chargePointId : '') + '?jwt=' + jwtToken + (last4 ? '&last4=' + last4 : '');
+    res.redirect(redirectUrl);
+  } catch (err) { console.error('[API] verify error:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+
+
+// POST /api/auth/check-email
+app.post('/api/auth/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { data: user } = await supabase.from('users').select('has_saved_card').eq('email', email.toLowerCase()).single();
+    const returning = !!(user && user.has_saved_card === true);
+    res.json({ returning });
+  } catch (err) { console.error('[API] check-email error:', err.message); res.json({ returning: false }); }
+});
+
+// POST /api/user/save-card
+app.post('/api/user/save-card', async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    const { data: session } = await supabase.from('sessions').select('*').eq('id', sessionId).single();
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+    if (!session.stripe_payment_intent_id) return res.status(400).json({ error: 'No payment intent on session' });
+    if (!STRIPE_ENABLED) return res.status(400).json({ error: 'Stripe not enabled' });
+    const { data: user } = await supabase.from('users').select('*').eq('id', session.user_id).single();
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const pi = await stripe.paymentIntents.retrieve(session.stripe_payment_intent_id);
+    const pmId = pi.payment_method;
+    if (!pmId) return res.status(400).json({ error: 'No payment method on payment intent' });
+    let customerId = user.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email: user.email, metadata: { evflo_user_id: user.id } });
+      customerId = customer.id;
+    }
+    await stripe.paymentMethods.attach(pmId, { customer: customerId });
+    await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
+    await supabase.from('users').update({ stripe_customer_id: customerId, stripe_default_pm: pmId, has_saved_card: true }).eq('id', user.id);
+    console.log('[API] Card saved for user', user.id);
+    res.json({ saved: true });
+  } catch (err) { console.error('[API] save-card error:', err.message); res.status(500).json({ error: err.message }); }
 });
 
 const PORT = process.env.PORT || 3001;
