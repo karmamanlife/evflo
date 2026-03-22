@@ -214,9 +214,14 @@ async function checkSessionTimeouts() {
         if (STRIPE_ENABLED && stripe && session.stripe_payment_intent_id) {
           try {
             if (totalCents >= 50) {
-              await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: totalCents });
+              let captureCents = totalCents;
+              if (totalCents > PRE_AUTH_AMOUNT_CENTS) {
+                console.log('[TIMEOUT] WARNING: Capture amount $' + (totalCents / 100).toFixed(2) + ' exceeds pre-auth $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' — capping at pre-auth amount');
+                captureCents = PRE_AUTH_AMOUNT_CENTS;
+              }
+              await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: captureCents });
               stripeChargeStatus = 'succeeded';
-              console.log('[TIMEOUT] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (totalCents / 100).toFixed(2));
+              console.log('[TIMEOUT] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (captureCents / 100).toFixed(2) + (totalCents > PRE_AUTH_AMOUNT_CENTS ? ' (capped from $' + (totalCents / 100).toFixed(2) + ')' : ''));
             } else {
               await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
               stripeChargeStatus = 'cancelled';
@@ -234,7 +239,7 @@ async function checkSessionTimeouts() {
           site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee,
           stripe_payment_intent_id: session.stripe_payment_intent_id,
           stripe_charge_status: stripeChargeStatus,
-          metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2), stopped_by: 'timeout' }
+          metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2), stopped_by: 'timeout', capture_capped: totalCents > PRE_AUTH_AMOUNT_CENTS, original_amount_cents: totalCents }
         });
         console.log('[TIMEOUT] Transaction recorded: ' + kwhConsumed + ' kWh — $' + (totalCents / 100).toFixed(2));
       } else {

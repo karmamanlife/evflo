@@ -1,7 +1,8 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const supabase = require('./db');
+
+const app = express();
 
 const STRIPE_ENABLED = !!process.env.STRIPE_SECRET_KEY;
 let stripe = null;
@@ -14,7 +15,6 @@ if (STRIPE_ENABLED) {
 
 const PRE_AUTH_AMOUNT_CENTS = parseInt(process.env.PRE_AUTH_AMOUNT_CENTS || '2500');
 
-const app = express();
 app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'x-admin-key', 'Authorization'] }));
 app.use(express.json());
 
@@ -42,10 +42,19 @@ app.post('/api/sessions/create-payment-intent', async (req, res) => {
     if (!STRIPE_ENABLED) return res.status(503).json({ error: 'Stripe not configured' });
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'email required' });
+    const { data: userForPi } = await supabase.from('users').upsert({ email }, { onConflict: 'email' }).select('id, stripe_customer_id').single();
+    let customerId = userForPi?.stripe_customer_id;
+    if (!customerId) {
+      const customer = await stripe.customers.create({ email, metadata: { evflo_user_id: userForPi?.id } });
+      customerId = customer.id;
+      if (userForPi?.id) await supabase.from('users').update({ stripe_customer_id: customerId }).eq('id', userForPi.id);
+    }
     const paymentIntent = await stripe.paymentIntents.create({
       amount: PRE_AUTH_AMOUNT_CENTS,
       currency: 'aud',
       capture_method: 'manual',
+      customer: customerId,
+      setup_future_usage: 'off_session',
       description: 'EVFLO charging session pre-authorisation',
       metadata: { email }
     });
@@ -57,33 +66,115 @@ app.post('/api/sessions/create-payment-intent', async (req, res) => {
 app.post('/api/sessions/start', async (req, res) => {
   try {
     const { chargePointId, email, paymentIntentId } = req.body;
-    if (!chargePointId || !email) return res.status(400).json({ error: 'chargePointId and email required' });
-    if (STRIPE_ENABLED && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
+
+    // F14: check for JWT auth (returning user with saved card)
+    const authHeader = req.headers['authorization'];
+    let jwtUserId = null;
+    let jwtEmail = null;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      try {
+        const jwt = require('jsonwebtoken');
+        const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
+        jwtUserId = decoded.userId;
+        jwtEmail = decoded.email;
+      } catch (e) {
+        return res.status(401).json({ error: 'Invalid or expired token. Please request a new magic link.' });
+      }
+    }
+
+    const effectiveEmail = jwtEmail || email;
+    if (!chargePointId || !effectiveEmail) return res.status(400).json({ error: 'chargePointId and email required' });
+
+    // Guest flow requires paymentIntentId; JWT flow does not
+    if (STRIPE_ENABLED && !jwtUserId && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
+
     const { data: cp, error: cpError } = await supabase.from('charge_points')
       .select('id, device_id, status, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
       .eq('device_id', chargePointId).single();
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
-    if (STRIPE_ENABLED) {
-      const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-      if (pi.status !== 'requires_capture') {
-        console.error('[API] PaymentIntent not confirmed — status: ' + pi.status);
-        return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
-      }
-    }
+
     const site = cp.sites;
     const ratePerKwh = parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh);
     const evfloMargin = parseFloat(site.evflo_fee_per_kwh);
+
+    // Upsert user
     const { data: user, error: userError } = await supabase.from('users')
-      .upsert({ email }, { onConflict: 'email' }).select('id, stripe_customer_id').single();
+      .upsert({ email: effectiveEmail }, { onConflict: 'email' }).select('id, email, stripe_customer_id, stripe_default_pm, has_saved_card').single();
     if (userError) throw new Error('User upsert failed: ' + userError.message);
+
+    let effectivePaymentIntentId = paymentIntentId || null;
+
+    if (jwtUserId) {
+      // ── RETURNING USER: use saved card to create a new PaymentIntent ──
+      if (!STRIPE_ENABLED) return res.status(400).json({ error: 'Stripe not enabled' });
+      if (!user.stripe_customer_id || !user.stripe_default_pm) {
+        return res.status(402).json({ error: 'No saved card on file. Please start a new session.' });
+      }
+      const pi = await stripe.paymentIntents.create({
+        amount: PRE_AUTH_AMOUNT_CENTS,
+        currency: 'aud',
+        capture_method: 'manual',
+        customer: user.stripe_customer_id,
+        payment_method: user.stripe_default_pm,
+        confirm: true,
+        off_session: true,
+        description: 'EVFLO charging session pre-authorisation (returning user)',
+        metadata: { email: effectiveEmail, evflo_user_id: user.id }
+      });
+      if (pi.status !== 'requires_capture') {
+        return res.status(402).json({ error: 'Card authorisation failed. Please use a different card.' });
+      }
+      effectivePaymentIntentId = pi.id;
+      console.log('[API] Returning user PI created: ' + pi.id);
+    } else {
+      // ── GUEST FLOW: verify the PI they confirmed on the frontend ──
+      if (STRIPE_ENABLED && paymentIntentId) {
+        const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+        if (pi.status !== 'requires_capture') {
+          return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
+        }
+
+        // Option A: attach PM to Customer NOW before capture, so save-card works later
+        try {
+          const pmId = pi.payment_method;
+          if (pmId) {
+            let customerId = user.stripe_customer_id;
+            if (!customerId) {
+              const customer = await stripe.customers.create({ email: effectiveEmail, metadata: { evflo_user_id: user.id } });
+              customerId = customer.id;
+              await supabase.from('users').update({ stripe_customer_id: customerId }).eq('id', user.id);
+            }
+            await stripe.paymentMethods.attach(pmId, { customer: customerId });
+            await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
+            // Store PM id on user so it's ready if they save card later
+            await supabase.from('users').update({ stripe_default_pm: pmId }).eq('id', user.id);
+            console.log('[API] PM attached to customer at session start for user', user.id);
+          }
+        } catch (attachErr) {
+          // Non-fatal — log but don't block session start
+          console.error('[API] PM attach warning (non-fatal):', attachErr.message);
+        }
+      }
+    }
+
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0, stripe_payment_intent_id: paymentIntentId || null })
+      .insert({
+        charge_point_id: cp.id,
+        user_id: user.id,
+        status: 'active',
+        rate_per_kwh: ratePerKwh,
+        evflo_margin: evfloMargin,
+        started_at: new Date().toISOString(),
+        start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0,
+        stripe_payment_intent_id: effectivePaymentIntentId
+      })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
+
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
     if (mqttClient) { mqttClient.publish('shelly1pmg4-' + cp.device_id + '/command/switch:0', 'on'); console.log('[API] Relay ON → ' + cp.device_id); }
-    console.log('[API] Session started: ' + session.id + ' — PI: ' + (paymentIntentId || 'none'));
+    console.log('[API] Session started: ' + session.id + ' — PI: ' + (effectivePaymentIntentId || 'none'));
     res.json({ sessionId: session.id, status: 'active', startedAt: new Date().toISOString(), ratePerKwh: ratePerKwh.toFixed(2) });
   } catch (err) { console.error('[API] POST /sessions/start error:', err.message); res.status(500).json({ error: 'Failed to start session' }); }
 });
@@ -106,6 +197,27 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
     res.json({ sessionId: session.id, status: session.status, siteName: site?.name || '', kwhConsumed: parseFloat(kwhConsumed.toFixed(4)), powerWatts: telemetry?.watts ?? 0, runningCostCents, runningCostAud: (runningCostCents / 100).toFixed(2), ratePerKwh: ratePerKwh.toFixed(2), currency: site?.currency || 'AUD', startedAt: session.started_at, endedAt: session.stopped_at ?? null });
   } catch (err) { console.error('[API] GET /sessions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
+
+// Helper: re-attach PM to customer after a PI is cancelled (Stripe detaches on cancel)
+async function reattachPmAfterCancel(userId, paymentIntentId) {
+  try {
+    const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_default_pm').eq('id', userId).single();
+    if (!user || !user.stripe_customer_id || !user.stripe_default_pm) return;
+    // Re-attach — ignore if already attached
+    try {
+      await stripe.paymentMethods.attach(user.stripe_default_pm, { customer: user.stripe_customer_id });
+      console.log('[API] PM re-attached after cancel for user', userId);
+    } catch (e) {
+      if (e.code === 'payment_method_already_attached') {
+        console.log('[API] PM already attached — no action needed');
+      } else {
+        console.error('[API] PM re-attach failed:', e.message);
+      }
+    }
+  } catch (e) {
+    console.error('[API] reattachPmAfterCancel error:', e.message);
+  }
+}
 
 app.post('/api/sessions/:sessionId/stop', async (req, res) => {
   try {
@@ -137,13 +249,20 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
       if (STRIPE_ENABLED && session.stripe_payment_intent_id) {
         try {
           if (totalCents >= 50) {
-            await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: totalCents });
+            let captureCents = totalCents;
+            if (totalCents > PRE_AUTH_AMOUNT_CENTS) {
+              console.log('[API] WARNING: Capture amount $' + (totalCents / 100).toFixed(2) + ' exceeds pre-auth $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' — capping at pre-auth amount');
+              captureCents = PRE_AUTH_AMOUNT_CENTS;
+            }
+            await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: captureCents });
             stripeChargeStatus = 'succeeded';
-            console.log('[API] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (totalCents / 100).toFixed(2));
+            console.log('[API] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (captureCents / 100).toFixed(2) + (totalCents > PRE_AUTH_AMOUNT_CENTS ? ' (capped from $' + (totalCents / 100).toFixed(2) + ')' : ''));
           } else {
             await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
             stripeChargeStatus = 'cancelled';
             console.log('[API] Stripe cancelled (amount < $0.50): ' + session.stripe_payment_intent_id);
+            // Re-attach PM to customer after cancel — Stripe detaches on cancel
+            await reattachPmAfterCancel(session.user_id, session.stripe_payment_intent_id);
           }
         } catch (stripeErr) {
           stripeChargeStatus = 'failed';
@@ -151,7 +270,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
         }
       }
       const { data: txn, error: txnError } = await supabase.from('transactions')
-        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_payment_intent_id: session.stripe_payment_intent_id, stripe_charge_status: stripeChargeStatus, metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2) } })
+        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_payment_intent_id: session.stripe_payment_intent_id, stripe_charge_status: stripeChargeStatus, metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2), capture_capped: totalCents > PRE_AUTH_AMOUNT_CENTS, original_amount_cents: totalCents } })
         .select('id').single();
       if (txnError) console.error('[API] Transaction insert failed:', txnError.message);
       else transactionId = txn.id;
@@ -160,6 +279,8 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
         try {
           await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
           console.log('[API] Stripe cancelled — 0 kWh session: ' + session.stripe_payment_intent_id);
+          // Re-attach PM to customer after cancel — Stripe detaches on cancel
+          await reattachPmAfterCancel(session.user_id, session.stripe_payment_intent_id);
         } catch (stripeErr) { console.error('[API] Stripe cancel failed:', stripeErr.message); }
       }
     }
@@ -176,9 +297,18 @@ app.get('/api/transactions/:transactionId', async (req, res) => {
   } catch (err) { console.error('[API] GET /transactions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-
 // ─── F14 Auth endpoints ────────────────────────────────────────────────────────
-// POST /api/auth/send-magic-link
+
+app.post('/api/auth/check-email', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const { data: user } = await supabase.from('users').select('has_saved_card').eq('email', email.toLowerCase()).single();
+    const returning = !!(user && user.has_saved_card === true);
+    res.json({ returning });
+  } catch (err) { console.error('[API] check-email error:', err.message); res.json({ returning: false }); }
+});
+
 app.post('/api/auth/send-magic-link', async (req, res) => {
   try {
     const { email, chargePointId } = req.body;
@@ -205,7 +335,6 @@ app.post('/api/auth/send-magic-link', async (req, res) => {
   } catch (err) { console.error('[API] send-magic-link error:', err.message); res.status(500).json({ error: err.message }); }
 });
 
-// GET /api/auth/verify
 app.get('/api/auth/verify', async (req, res) => {
   try {
     const { token } = req.query;
@@ -226,48 +355,42 @@ app.get('/api/auth/verify', async (req, res) => {
       } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
     }
     const chargePointId = authToken.charge_point_id;
-    const redirectUrl = 'https://evflo.com.au/charger/' + (chargePointId ? chargePointId : '') + '?jwt=' + jwtToken + (last4 ? '&last4=' + last4 : '');
+    const redirectUrl = 'https://evflo.com.au/start/' + (chargePointId || 'EVFLO-01') + '?jwt=' + jwtToken + (last4 ? '&last4=' + last4 : '');
     res.redirect(redirectUrl);
   } catch (err) { console.error('[API] verify error:', err.message); res.status(500).json({ error: err.message }); }
 });
 
-
-
-// POST /api/auth/check-email
-app.post('/api/auth/check-email', async (req, res) => {
-  try {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: 'Email required' });
-    const { data: user } = await supabase.from('users').select('has_saved_card').eq('email', email.toLowerCase()).single();
-    const returning = !!(user && user.has_saved_card === true);
-    res.json({ returning });
-  } catch (err) { console.error('[API] check-email error:', err.message); res.json({ returning: false }); }
-});
-
 // POST /api/user/save-card
+// Option A: PM already attached to Customer at session start.
+// This endpoint now just flips has_saved_card = true and issues a JWT.
 app.post('/api/user/save-card', async (req, res) => {
   try {
     const { sessionId } = req.body;
     if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
-    const { data: session } = await supabase.from('sessions').select('*').eq('id', sessionId).single();
+    const { data: session } = await supabase.from('sessions').select('user_id').eq('id', sessionId).single();
     if (!session) return res.status(404).json({ error: 'Session not found' });
-    if (!session.stripe_payment_intent_id) return res.status(400).json({ error: 'No payment intent on session' });
-    if (!STRIPE_ENABLED) return res.status(400).json({ error: 'Stripe not enabled' });
-    const { data: user } = await supabase.from('users').select('*').eq('id', session.user_id).single();
+    const { data: user } = await supabase.from('users').select('id, email, stripe_customer_id, stripe_default_pm').eq('id', session.user_id).single();
     if (!user) return res.status(404).json({ error: 'User not found' });
-    const pi = await stripe.paymentIntents.retrieve(session.stripe_payment_intent_id);
-    const pmId = pi.payment_method;
-    if (!pmId) return res.status(400).json({ error: 'No payment method on payment intent' });
-    let customerId = user.stripe_customer_id;
-    if (!customerId) {
-      const customer = await stripe.customers.create({ email: user.email, metadata: { evflo_user_id: user.id } });
-      customerId = customer.id;
+    if (!user.stripe_default_pm) return res.status(400).json({ error: 'No payment method on file. Please start a new session.' });
+
+    // Flip the flag — PM is already attached (done at session start)
+    await supabase.from('users').update({ has_saved_card: true }).eq('id', user.id);
+
+    // Get last4 for display
+    let last4 = null;
+    if (STRIPE_ENABLED && user.stripe_default_pm) {
+      try {
+        const pm = await stripe.paymentMethods.retrieve(user.stripe_default_pm);
+        last4 = pm.card ? pm.card.last4 : null;
+      } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
     }
-    await stripe.paymentMethods.attach(pmId, { customer: customerId });
-    await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
-    await supabase.from('users').update({ stripe_customer_id: customerId, stripe_default_pm: pmId, has_saved_card: true }).eq('id', user.id);
-    console.log('[API] Card saved for user', user.id);
-    res.json({ saved: true });
+
+    // Issue JWT so they're recognised next session immediately
+    const jwt = require('jsonwebtoken');
+    const jwtToken = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
+
+    console.log('[API] Card saved (flag set) for user', user.id);
+    res.json({ saved: true, jwt: jwtToken, last4 });
   } catch (err) { console.error('[API] save-card error:', err.message); res.status(500).json({ error: err.message }); }
 });
 
@@ -277,7 +400,7 @@ module.exports = { app, setMqttClient };
 
 // ─── Admin endpoints ───────────────────────────────────────────────────────────
 const adminAuth = (req, res, next) => {
-  if (req.headers['x-admin-key'] !== 'EVFLO#2026') {
+  if (req.headers['x-admin-key'] !== (process.env.ADMIN_KEY || 'EVFLO#2026')) {
     return res.status(401).json({ error: 'Unauthorised' });
   }
   next();
@@ -304,11 +427,17 @@ app.post('/api/admin/charge-points', adminAuth, async (req, res) => {
 });
 
 app.post('/api/admin/sites', adminAuth, async (req, res) => {
-  const { name, address, type, siteHostRatePerKwh, evfloFeePerKwh } = req.body;
+  const { name, street, suburb, postcode, state, type, siteHostRatePerKwh, evfloFeePerKwh } = req.body;
   if (!name || !type) return res.status(400).json({ error: 'name and type are required' });
+  const addressParts = [street, suburb, postcode, state].filter(Boolean);
+  const address = addressParts.length > 0 ? addressParts.join(', ') : null;
   const { data, error } = await supabase.from('sites').insert({
     name,
-    address: address || null,
+    address,
+    street: street || null,
+    suburb: suburb || null,
+    postcode: postcode || null,
+    state: state || null,
     type,
     site_host_rate_per_kwh: siteHostRatePerKwh || 0.35,
     evflo_fee_per_kwh: evfloFeePerKwh || 0.10,
