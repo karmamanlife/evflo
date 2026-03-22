@@ -112,6 +112,18 @@ async function storeTelemetry(deviceId, kwhReading, powerWatts) {
     const { error: iErr } = await supabase.from('session_telemetry').insert({ session_id: session.id, kwh_total: kwhReading, watts: powerWatts, recorded_at: new Date().toISOString() });
     if (iErr) { console.error('[TELEMETRY] Insert error:', iErr.message); return; }
     console.log('[TELEMETRY] Saved ' + kwhReading + ' kWh, ' + powerWatts + 'W for session ' + session.id);
+    // B9: 80% hold monitoring — foundation for future incremental auth
+    try {
+      const { data: sess } = await supabase.from('sessions').select('start_kwh_reading, rate_per_kwh').eq('id', session.id).single();
+      if (sess) {
+        const estimatedKwh = Math.max(0, kwhReading - parseFloat(sess.start_kwh_reading || 0));
+        const estimatedCents = Math.round(estimatedKwh * parseFloat(sess.rate_per_kwh || 0) * 100);
+        const holdThreshold = Math.round(PRE_AUTH_AMOUNT_CENTS * 0.8);
+        if (estimatedCents > holdThreshold) {
+          console.log('[HOLD-MONITOR] WARNING: Session ' + session.id + ' estimated cost $' + (estimatedCents / 100).toFixed(2) + ' exceeds 80% of $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' hold');
+        }
+      }
+    } catch (monErr) { /* non-fatal monitoring */ }
   } catch(err) { console.error('[TELEMETRY] Error:', err.message); }
 }
 
