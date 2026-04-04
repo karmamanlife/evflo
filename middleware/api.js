@@ -324,13 +324,17 @@ app.post('/api/auth/send-magic-link', async (req, res) => {
     const { Resend } = require('resend');
     const resend = new Resend(process.env.RESEND_API_KEY);
     const magicLink = 'https://evflo.com.au/auth/verify?token=' + token;
-    await resend.emails.send({
+    const { data: emailData, error: emailError } = await resend.emails.send({
       from: 'EVFLO <noreply@evflo.com.au>',
       to: email,
       subject: 'EVFLO — Tap to start charging',
       html: '<p>Hi,</p><p>Tap the link below to start your charging session. This link expires in 15 minutes.</p><p><a href="' + magicLink + '" style="background:#22c55e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;">Start Charging</a></p><p>If you did not request this, ignore this email.</p>'
     });
-    console.log('[API] Magic link sent to', email);
+    if (emailError) {
+      console.error('[API] Resend error:', JSON.stringify(emailError));
+      return res.status(500).json({ error: 'Failed to send magic link email' });
+    }
+    console.log('[API] Magic link sent to', email, '— Resend ID:', emailData?.id);
     res.json({ sent: true });
   } catch (err) { console.error('[API] send-magic-link error:', err.message); res.status(500).json({ error: err.message }); }
 });
