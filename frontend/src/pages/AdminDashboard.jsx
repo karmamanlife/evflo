@@ -16,6 +16,10 @@ export default function AdminDashboard() {
   const [showAddCP, setShowAddCP] = useState(false);
   const [newDeviceId, setNewDeviceId] = useState('');
   const [newLabel, setNewLabel] = useState('');
+  const [newDeviceType, setNewDeviceType] = useState('shelly_1pm');
+  const [newOcppIdentity, setNewOcppIdentity] = useState('');
+  const [newMaxPowerKw, setNewMaxPowerKw] = useState('2.3');
+  const [newConnectorType, setNewConnectorType] = useState('schuko');
   const [addingCP, setAddingCP] = useState(false);
   const [cpError, setCpError] = useState('');
 
@@ -88,18 +92,33 @@ export default function AdminDashboard() {
   const handleCreateCP = async () => {
     if (!newDeviceId.trim()) { setCpError('Device ID is required.'); return; }
     if (!selectedSite) { setCpError('Select a site first.'); return; }
+    if (newDeviceType === 'ocpp' && !newOcppIdentity.trim()) { setCpError('OCPP Identity is required for OCPP devices.'); return; }
+    const maxPower = parseFloat(newMaxPowerKw);
+    if (isNaN(maxPower) || maxPower <= 0) { setCpError('Max power must be a positive number.'); return; }
     setAddingCP(true);
     setCpError('');
     try {
       const res = await fetch(`${API}/api/admin/charge-points`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-admin-key': 'EVFLO#2026' },
-        body: JSON.stringify({ siteId: selectedSite.id, deviceId: newDeviceId.trim(), label: newLabel.trim() })
+        body: JSON.stringify({
+          siteId: selectedSite.id,
+          deviceId: newDeviceId.trim(),
+          label: newLabel.trim(),
+          deviceType: newDeviceType,
+          ocppIdentity: newDeviceType === 'ocpp' ? newOcppIdentity.trim() : null,
+          maxPowerKw: maxPower,
+          connectorType: newConnectorType,
+        })
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed to create charge point');
       setNewDeviceId('');
       setNewLabel('');
+      setNewDeviceType('shelly_1pm');
+      setNewOcppIdentity('');
+      setNewMaxPowerKw('2.3');
+      setNewConnectorType('schuko');
       setShowAddCP(false);
       loadChargePoints(selectedSite.id);
     } catch (err) { setCpError(err.message); }
@@ -168,6 +187,9 @@ export default function AdminDashboard() {
 
   const siteTypes = ['hotel', 'strata', 'motel', 'caravan_park', 'dealership', 'council', 'commercial', 'tourism'];
   const stateOptions = ['ACT', 'NSW', 'NT', 'QLD', 'SA', 'TAS', 'VIC', 'WA'];
+  const connectorTypes = ['schuko', 'type2', 'ccs', 'chademo'];
+
+  const selectStyle = { background: 'var(--grey-dark)', color: 'var(--cream)', border: '1px solid var(--grey-card)', borderRadius: '4px', padding: '12px 16px', fontSize: '0.95rem', width: '100%' };
 
   if (loading) {
     return (
@@ -241,13 +263,13 @@ export default function AdminDashboard() {
               <div style={{ display: 'flex', gap: '12px' }}>
                 <div style={{ flex: 1 }}>
                   <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>State</div>
-                  <select value={newState} onChange={e => setNewState(e.target.value)} style={{ background: 'var(--grey-dark)', color: 'var(--cream)', border: '1px solid var(--grey-card)', borderRadius: '4px', padding: '12px 16px', fontSize: '0.95rem', width: '100%' }}>
+                  <select value={newState} onChange={e => setNewState(e.target.value)} style={selectStyle}>
                     {stateOptions.map(s => <option key={s} value={s}>{s}</option>)}
                   </select>
                 </div>
                 <div style={{ flex: 2 }}>
                   <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Site Type</div>
-                  <select value={newType} onChange={e => setNewType(e.target.value)} style={{ background: 'var(--grey-dark)', color: 'var(--cream)', border: '1px solid var(--grey-card)', borderRadius: '4px', padding: '12px 16px', fontSize: '0.95rem', width: '100%' }}>
+                  <select value={newType} onChange={e => setNewType(e.target.value)} style={selectStyle}>
                     {siteTypes.map(t => <option key={t} value={t}>{t.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase())}</option>)}
                   </select>
                 </div>
@@ -293,6 +315,13 @@ export default function AdminDashboard() {
                     <div>
                       <div style={{ fontFamily: 'Barlow Condensed, sans-serif', fontSize: '1.1rem', fontWeight: 600 }}>{cp.label || cp.device_id}</div>
                       <div style={{ fontSize: '0.8rem', color: 'var(--cream-dim)', marginTop: '2px' }}>ID: {cp.device_id}</div>
+                      {cp.device_type && (
+                        <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginTop: '2px' }}>
+                          {cp.device_type === 'ocpp' ? 'OCPP' : 'Shelly 1PM'}
+                          {cp.max_power_kw ? ` · ${cp.max_power_kw}kW` : ''}
+                          {cp.connector_type ? ` · ${cp.connector_type.toUpperCase()}` : ''}
+                        </div>
+                      )}
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
                       <span style={{ width: '7px', height: '7px', borderRadius: '50%', background: cp.status === 'available' ? 'var(--green)' : cp.status === 'occupied' ? '#f0a500' : '#888', display: 'inline-block' }} />
@@ -309,6 +338,28 @@ export default function AdminDashboard() {
             {showAddCP ? (
               <div style={{ background: 'var(--grey-card)', borderRadius: '4px', padding: '20px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
                 <div style={{ fontSize: '0.75rem', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--cream-dim)' }}>New Charge Point</div>
+
+                {/* Device Type */}
+                <div>
+                  <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Device Type *</div>
+                  <select value={newDeviceType} onChange={e => {
+                    setNewDeviceType(e.target.value);
+                    setNewMaxPowerKw(e.target.value === 'ocpp' ? '22' : '2.3');
+                    setNewConnectorType(e.target.value === 'ocpp' ? 'type2' : 'schuko');
+                  }} style={selectStyle}>
+                    <option value="shelly_1pm">Shelly 1PM (Level 1 — GPO)</option>
+                    <option value="ocpp">OCPP (Level 2 — AC)</option>
+                  </select>
+                </div>
+
+                {/* OCPP Identity — only shown for OCPP */}
+                {newDeviceType === 'ocpp' && (
+                  <div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>OCPP Identity *</div>
+                    <input className="input-field" value={newOcppIdentity} onChange={e => setNewOcppIdentity(e.target.value)} placeholder="e.g. SUNGROW-001 (must match charger config)" />
+                  </div>
+                )}
+
                 <div>
                   <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Device ID *</div>
                   <input className="input-field" value={newDeviceId} onChange={e => setNewDeviceId(e.target.value.toUpperCase())} placeholder="Auto-generated — edit if needed" />
@@ -317,6 +368,20 @@ export default function AdminDashboard() {
                   <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Label (optional)</div>
                   <input className="input-field" value={newLabel} onChange={e => setNewLabel(e.target.value)} placeholder="e.g. Car Park Level 1" />
                 </div>
+
+                <div style={{ display: 'flex', gap: '12px' }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Max Power (kW)</div>
+                    <input className="input-field" type="number" step="0.1" min="0.1" value={newMaxPowerKw} onChange={e => setNewMaxPowerKw(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--cream-dim)', marginBottom: '6px' }}>Connector Type</div>
+                    <select value={newConnectorType} onChange={e => setNewConnectorType(e.target.value)} style={selectStyle}>
+                      {connectorTypes.map(t => <option key={t} value={t}>{t.toUpperCase()}</option>)}
+                    </select>
+                  </div>
+                </div>
+
                 {cpError && <div style={{ fontSize: '0.85rem', color: '#ff6b6b' }}>{cpError}</div>}
                 <div style={{ display: 'flex', gap: '12px' }}>
                   <button className="btn-primary" onClick={handleCreateCP} disabled={addingCP}>{addingCP ? 'Creating...' : 'Create ›'}</button>

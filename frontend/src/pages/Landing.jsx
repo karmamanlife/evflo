@@ -4,6 +4,13 @@ import Logo from '../components/Logo';
 
 const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001';
 
+const CONNECTOR_LABELS = {
+  schuko: 'Schuko (GPO)',
+  type2: 'Type 2 (AC)',
+  ccs: 'CCS (DC)',
+  chademo: 'CHAdeMO (DC)',
+};
+
 export default function Landing() {
   const navigate = useNavigate();
   const { chargePointId } = useParams();
@@ -116,6 +123,29 @@ export default function Landing() {
                 <div style={{ fontFamily: 'Barlow Condensed, sans-serif', fontSize: '1rem' }}>{charger.currency}</div>
               </div>
             </div>
+
+            {/* Connector / power info — shown only if data available */}
+            {(charger.connectorType || charger.maxPowerKw) && (
+              <>
+                <div className="divider" />
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  {charger.connectorType && (
+                    <div>
+                      <div style={{ fontSize: '0.75rem', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--cream-dim)', marginBottom: '6px' }}>Connector</div>
+                      <div style={{ fontFamily: 'Barlow Condensed, sans-serif', fontSize: '1rem' }}>
+                        {CONNECTOR_LABELS[charger.connectorType] || charger.connectorType.toUpperCase()}
+                      </div>
+                    </div>
+                  )}
+                  {charger.maxPowerKw && (
+                    <div style={{ textAlign: charger.connectorType ? 'right' : 'left' }}>
+                      <div style={{ fontSize: '0.75rem', letterSpacing: '0.1em', textTransform: 'uppercase', color: 'var(--cream-dim)', marginBottom: '6px' }}>Max Power</div>
+                      <div style={{ fontFamily: 'Barlow Condensed, sans-serif', fontSize: '1rem' }}>{charger.maxPowerKw} kW</div>
+                    </div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
 
           {/* Info line */}
