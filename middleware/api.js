@@ -20,20 +20,75 @@ app.use(express.json());
 
 let mqttClient = null;
 let deviceStateCache = {};
+let ocppModule = null;
+
 function setMqttClient(client, deviceMap, deviceState) { mqttClient = client; deviceStateCache = deviceState || {}; }
+function setOcppModule(ocpp) { ocppModule = ocpp; }
+
+// ─── Command Router (F17) ──────────────────────────────────────────────────────
+// Abstracts hardware communication. Checks device_type and dispatches accordingly.
+// For Shelly: MQTT publish (existing behaviour, unchanged).
+// For OCPP: RemoteStartTransaction / RemoteStopTransaction via WebSocket.
+
+async function sendChargeCommand(chargePoint, action, sessionId) {
+  const deviceType = chargePoint.device_type || 'shelly';
+  const deviceId = chargePoint.device_id;
+
+  if (deviceType === 'shelly') {
+    // ── Shelly/MQTT path — identical to original code ──
+    if (mqttClient) {
+      const command = action === 'start' ? 'on' : 'off';
+      mqttClient.publish('shelly1pmg4-' + deviceId + '/command/switch:0', command);
+      console.log('[CMD] MQTT relay ' + command.toUpperCase() + ' → ' + deviceId);
+    } else {
+      console.error('[CMD] MQTT client not available for ' + deviceId);
+    }
+  } else if (deviceType === 'ocpp') {
+    // ── OCPP path — WebSocket command via ocpp.js ──
+    if (!ocppModule) {
+      throw new Error('OCPP module not initialised');
+    }
+    const ocppIdentity = chargePoint.ocpp_identity;
+    if (!ocppIdentity) {
+      throw new Error('No ocpp_identity configured for charge point ' + deviceId);
+    }
+    if (!ocppModule.isChargerConnected(ocppIdentity)) {
+      throw new Error('OCPP charger ' + ocppIdentity + ' is not connected');
+    }
+    if (action === 'start') {
+      await ocppModule.sendRemoteStart(ocppIdentity, 'EVFLO');
+      console.log('[CMD] OCPP RemoteStart → ' + ocppIdentity);
+    } else {
+      await ocppModule.sendRemoteStop(ocppIdentity, sessionId);
+      console.log('[CMD] OCPP RemoteStop → ' + ocppIdentity);
+    }
+  } else {
+    throw new Error('Unknown device_type: ' + deviceType);
+  }
+}
 
 app.get('/health', (req, res) => res.json({ status: 'ok', stripe: STRIPE_ENABLED }));
 
 app.get('/api/charger/:chargePointId', async (req, res) => {
   try {
     const { data: cp, error } = await supabase.from('charge_points')
-      .select('id, device_id, status, sites(id, name, address, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
+      .select('id, device_id, status, device_type, connector_type, max_power_kw, sites(id, name, address, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
       .eq('device_id', req.params.chargePointId).single();
     if (error || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
     const site = cp.sites;
     const ratePerKwh = (parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh)).toFixed(2);
-    res.json({ chargePointId: cp.id, deviceId: cp.device_id, siteName: site.name, siteAddress: site.address, siteId: site.id, ratePerKwh, currency: site.currency });
+    res.json({
+      chargePointId: cp.id,
+      deviceId: cp.device_id,
+      siteName: site.name,
+      siteAddress: site.address,
+      siteId: site.id,
+      ratePerKwh,
+      currency: site.currency,
+      connectorType: cp.connector_type || 'gpo',
+      maxPowerKw: parseFloat(cp.max_power_kw || 2.3)
+    });
   } catch (err) { console.error('[API] GET /charger error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -89,7 +144,7 @@ app.post('/api/sessions/start', async (req, res) => {
     if (STRIPE_ENABLED && !jwtUserId && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
 
     const { data: cp, error: cpError } = await supabase.from('charge_points')
-      .select('id, device_id, status, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
+      .select('id, device_id, status, device_type, ocpp_identity, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
       .eq('device_id', chargePointId).single();
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
@@ -135,7 +190,7 @@ app.post('/api/sessions/start', async (req, res) => {
           return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
         }
 
-        // Option A: attach PM to Customer NOW before capture, so save-card works later
+        // Attach PM to Customer so save-card works later
         try {
           const pmId = pi.payment_method;
           if (pmId) {
@@ -147,7 +202,6 @@ app.post('/api/sessions/start', async (req, res) => {
             }
             await stripe.paymentMethods.attach(pmId, { customer: customerId });
             await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
-            // Store PM id on user so it's ready if they save card later
             await supabase.from('users').update({ stripe_default_pm: pmId }).eq('id', user.id);
             console.log('[API] PM attached to customer at session start for user', user.id);
           }
@@ -158,6 +212,11 @@ app.post('/api/sessions/start', async (req, res) => {
       }
     }
 
+    // For Shelly devices, use cached kWh. For OCPP, start_kwh_reading is updated by StartTransaction handler.
+    const startKwh = (cp.device_type === 'shelly' && deviceStateCache[cp.device_id])
+      ? deviceStateCache[cp.device_id].kwh
+      : 0;
+
     const { data: session, error: sessionError } = await supabase.from('sessions')
       .insert({
         charge_point_id: cp.id,
@@ -166,14 +225,28 @@ app.post('/api/sessions/start', async (req, res) => {
         rate_per_kwh: ratePerKwh,
         evflo_margin: evfloMargin,
         started_at: new Date().toISOString(),
-        start_kwh_reading: deviceStateCache[cp.device_id] ? deviceStateCache[cp.device_id].kwh : 0,
+        start_kwh_reading: startKwh,
         stripe_payment_intent_id: effectivePaymentIntentId
       })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
 
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
-    if (mqttClient) { mqttClient.publish('shelly1pmg4-' + cp.device_id + '/command/switch:0', 'on'); console.log('[API] Relay ON → ' + cp.device_id); }
+
+    // ── Command Router: send start command to hardware ──
+    try {
+      await sendChargeCommand(cp, 'start');
+    } catch (cmdErr) {
+      // If OCPP charger rejects or is offline, roll back session
+      console.error('[API] Charge command failed:', cmdErr.message);
+      await supabase.from('sessions').update({ status: 'cancelled', stopped_at: new Date().toISOString() }).eq('id', session.id);
+      await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
+      if (STRIPE_ENABLED && effectivePaymentIntentId) {
+        try { await stripe.paymentIntents.cancel(effectivePaymentIntentId); } catch (e) { /* best effort */ }
+      }
+      return res.status(503).json({ error: 'Charger not responding. Please try again.' });
+    }
+
     console.log('[API] Session started: ' + session.id + ' — PI: ' + (effectivePaymentIntentId || 'none'));
     res.json({ sessionId: session.id, status: 'active', startedAt: new Date().toISOString(), ratePerKwh: ratePerKwh.toFixed(2) });
   } catch (err) { console.error('[API] POST /sessions/start error:', err.message); res.status(500).json({ error: 'Failed to start session' }); }
@@ -203,7 +276,6 @@ async function reattachPmAfterCancel(userId, paymentIntentId) {
   try {
     const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_default_pm').eq('id', userId).single();
     if (!user || !user.stripe_customer_id || !user.stripe_default_pm) return;
-    // Re-attach — ignore if already attached
     try {
       await stripe.paymentMethods.attach(user.stripe_default_pm, { customer: user.stripe_customer_id });
       console.log('[API] PM re-attached after cancel for user', userId);
@@ -223,13 +295,21 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .select('id, user_id, status, rate_per_kwh, evflo_margin, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
+      .select('id, user_id, status, rate_per_kwh, evflo_margin, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, device_type, ocpp_identity, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
       .eq('id', sessionId).single();
     if (sessionError || !session) return res.status(404).json({ error: 'Session not found' });
     if (session.status !== 'active') return res.status(409).json({ error: 'Session is ' + session.status });
     const cp = session.charge_points;
     const site = cp.sites;
-    if (mqttClient) { mqttClient.publish('shelly1pmg4-' + cp.device_id + '/command/switch:0', 'off'); console.log('[API] Relay OFF → ' + cp.device_id); }
+
+    // ── Command Router: send stop command to hardware ──
+    try {
+      await sendChargeCommand(cp, 'stop', sessionId);
+    } catch (cmdErr) {
+      // Log but don't block stop — we still need to bill and release the charge point
+      console.error('[API] Stop command warning (non-fatal):', cmdErr.message);
+    }
+
     const { data: finalTelemetry } = await supabase.from('session_telemetry')
       .select('kwh_total').eq('session_id', sessionId).order('recorded_at', { ascending: false }).limit(1).single();
     const finalKwh = finalTelemetry?.kwh_total ?? 0;
@@ -261,7 +341,6 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
             await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
             stripeChargeStatus = 'cancelled';
             console.log('[API] Stripe cancelled (amount < $0.50): ' + session.stripe_payment_intent_id);
-            // Re-attach PM to customer after cancel — Stripe detaches on cancel
             await reattachPmAfterCancel(session.user_id, session.stripe_payment_intent_id);
           }
         } catch (stripeErr) {
@@ -279,7 +358,6 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
         try {
           await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
           console.log('[API] Stripe cancelled — 0 kWh session: ' + session.stripe_payment_intent_id);
-          // Re-attach PM to customer after cancel — Stripe detaches on cancel
           await reattachPmAfterCancel(session.user_id, session.stripe_payment_intent_id);
         } catch (stripeErr) { console.error('[API] Stripe cancel failed:', stripeErr.message); }
       }
@@ -364,9 +442,6 @@ app.get('/api/auth/verify', async (req, res) => {
   } catch (err) { console.error('[API] verify error:', err.message); res.status(500).json({ error: err.message }); }
 });
 
-// POST /api/user/save-card
-// Option A: PM already attached to Customer at session start.
-// This endpoint now just flips has_saved_card = true and issues a JWT.
 app.post('/api/user/save-card', async (req, res) => {
   try {
     const { sessionId } = req.body;
@@ -376,11 +451,7 @@ app.post('/api/user/save-card', async (req, res) => {
     const { data: user } = await supabase.from('users').select('id, email, stripe_customer_id, stripe_default_pm').eq('id', session.user_id).single();
     if (!user) return res.status(404).json({ error: 'User not found' });
     if (!user.stripe_default_pm) return res.status(400).json({ error: 'No payment method on file. Please start a new session.' });
-
-    // Flip the flag — PM is already attached (done at session start)
     await supabase.from('users').update({ has_saved_card: true }).eq('id', user.id);
-
-    // Get last4 for display
     let last4 = null;
     if (STRIPE_ENABLED && user.stripe_default_pm) {
       try {
@@ -388,11 +459,8 @@ app.post('/api/user/save-card', async (req, res) => {
         last4 = pm.card ? pm.card.last4 : null;
       } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
     }
-
-    // Issue JWT so they're recognised next session immediately
     const jwt = require('jsonwebtoken');
     const jwtToken = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
-
     console.log('[API] Card saved (flag set) for user', user.id);
     res.json({ saved: true, jwt: jwtToken, last4 });
   } catch (err) { console.error('[API] save-card error:', err.message); res.status(500).json({ error: err.message }); }
@@ -400,7 +468,7 @@ app.post('/api/user/save-card', async (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log('[API] Server listening on port ' + PORT));
-module.exports = { app, setMqttClient };
+module.exports = { app, setMqttClient, setOcppModule };
 
 // ─── Admin endpoints ───────────────────────────────────────────────────────────
 const adminAuth = (req, res, next) => {
@@ -423,9 +491,23 @@ app.get('/api/admin/sites/:siteId/charge-points', adminAuth, async (req, res) =>
 });
 
 app.post('/api/admin/charge-points', adminAuth, async (req, res) => {
-  const { siteId, deviceId, label } = req.body;
+  const { siteId, deviceId, label, deviceType, ocppIdentity, maxPowerKw, connectorType } = req.body;
   if (!siteId || !deviceId) return res.status(400).json({ error: 'siteId and deviceId are required' });
-  const { data, error } = await supabase.from('charge_points').insert({ site_id: siteId, device_id: deviceId, label: label || null, status: 'available' }).select().single();
+
+  // Validate OCPP fields
+  const type = deviceType || 'shelly';
+  if (type === 'ocpp' && !ocppIdentity) return res.status(400).json({ error: 'ocppIdentity required for OCPP devices' });
+
+  const { data, error } = await supabase.from('charge_points').insert({
+    site_id: siteId,
+    device_id: deviceId,
+    label: label || null,
+    status: 'available',
+    device_type: type,
+    ocpp_identity: type === 'ocpp' ? ocppIdentity : null,
+    max_power_kw: maxPowerKw || (type === 'ocpp' ? 7.4 : 2.3),
+    connector_type: connectorType || (type === 'ocpp' ? 'type2_socket' : 'gpo')
+  }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });

@@ -1,8 +1,11 @@
 require('dotenv').config();
 const mqtt = require('mqtt');
 const supabase = require('./db');
-const { setMqttClient } = require('./api');
-require('./ocpp');
+const { setMqttClient, setOcppModule } = require('./api');
+const ocppModule = require('./ocpp');
+
+// Wire OCPP module into api.js command router
+setOcppModule(ocppModule);
 
 const DEVICE_TOPIC_MAP = { 'EVFLO-01': 'shelly1pmg4-EVFLO-01' };
 const TOPIC_DEVICE_MAP = {};
@@ -36,7 +39,7 @@ async function recoverSessions() {
     console.log('[RECOVERY] Checking for orphaned active sessions...');
     const { data: sessions, error } = await supabase
       .from('sessions')
-      .select('id, user_id, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, sites(id))')
+      .select('id, user_id, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, device_type, sites(id))')
       .eq('status', 'active');
     if (error) { console.error('[RECOVERY] Query failed:', error.message); return; }
     if (!sessions || sessions.length === 0) { console.log('[RECOVERY] No orphaned sessions found.'); return; }
@@ -47,7 +50,8 @@ async function recoverSessions() {
     for (const session of sessions) {
       const cp = session.charge_points;
       const deviceId = cp?.device_id;
-      console.log('[RECOVERY] Session ' + session.id + ' — device ' + deviceId);
+      const deviceType = cp?.device_type || 'shelly';
+      console.log('[RECOVERY] Session ' + session.id + ' — device ' + deviceId + ' (' + deviceType + ')');
       await supabase.from('sessions').update({
         status: 'cancelled',
         stopped_at: new Date().toISOString(),
@@ -64,7 +68,8 @@ async function recoverSessions() {
           console.log('[RECOVERY] Stripe cancel skipped: ' + stripeErr.message);
         }
       }
-      if (deviceId && DEVICE_TOPIC_MAP[deviceId]) {
+      // Relay OFF — Shelly via MQTT, OCPP chargers will self-stop on disconnect/timeout
+      if (deviceType === 'shelly' && deviceId && DEVICE_TOPIC_MAP[deviceId]) {
         client.publish(DEVICE_TOPIC_MAP[deviceId] + '/command/switch:0', 'off');
         console.log('[RECOVERY] Relay OFF sent to ' + deviceId);
       }
@@ -103,6 +108,8 @@ function handleShellyMessage(topic, payload) {
   }
 }
 
+const PRE_AUTH_AMOUNT_CENTS = parseInt(process.env.PRE_AUTH_AMOUNT_CENTS || '2500');
+
 async function storeTelemetry(deviceId, kwhReading, powerWatts) {
   try {
     const { data: cp, error: cpErr } = await supabase.from('charge_points').select('id').eq('device_id', deviceId).single();
@@ -112,7 +119,7 @@ async function storeTelemetry(deviceId, kwhReading, powerWatts) {
     const { error: iErr } = await supabase.from('session_telemetry').insert({ session_id: session.id, kwh_total: kwhReading, watts: powerWatts, recorded_at: new Date().toISOString() });
     if (iErr) { console.error('[TELEMETRY] Insert error:', iErr.message); return; }
     console.log('[TELEMETRY] Saved ' + kwhReading + ' kWh, ' + powerWatts + 'W for session ' + session.id);
-    // B9: 80% hold monitoring — foundation for future incremental auth
+    // B9: 80% hold monitoring
     try {
       const { data: sess } = await supabase.from('sessions').select('start_kwh_reading, rate_per_kwh').eq('id', session.id).single();
       if (sess) {
@@ -170,7 +177,7 @@ async function checkSessionTimeouts() {
     const cutoff = new Date(Date.now() - SESSION_TIMEOUT_HOURS * 60 * 60 * 1000).toISOString();
     const { data: sessions, error } = await supabase
       .from('sessions')
-      .select('id, user_id, start_kwh_reading, rate_per_kwh, evflo_margin, stripe_payment_intent_id, charge_points(id, device_id, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
+      .select('id, user_id, start_kwh_reading, rate_per_kwh, evflo_margin, stripe_payment_intent_id, charge_points(id, device_id, device_type, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
       .eq('status', 'active')
       .lt('started_at', cutoff);
     if (error) { console.error('[TIMEOUT] Query failed:', error.message); return; }
@@ -184,12 +191,26 @@ async function checkSessionTimeouts() {
       const cp = session.charge_points;
       const site = cp?.sites;
       const deviceId = cp?.device_id;
-      console.log('[TIMEOUT] Auto-stopping session ' + session.id + ' — device ' + deviceId);
+      const deviceType = cp?.device_type || 'shelly';
+      console.log('[TIMEOUT] Auto-stopping session ' + session.id + ' — device ' + deviceId + ' (' + deviceType + ')');
 
-      // Relay OFF
-      if (deviceId && DEVICE_TOPIC_MAP[deviceId]) {
+      // Relay OFF — route by device type
+      if (deviceType === 'shelly' && deviceId && DEVICE_TOPIC_MAP[deviceId]) {
         client.publish(DEVICE_TOPIC_MAP[deviceId] + '/command/switch:0', 'off');
         console.log('[TIMEOUT] Relay OFF sent to ' + deviceId);
+      } else if (deviceType === 'ocpp') {
+        // For OCPP chargers, attempt RemoteStopTransaction
+        try {
+          const { data: cpFull } = await supabase.from('charge_points').select('ocpp_identity').eq('id', cp.id).single();
+          if (cpFull?.ocpp_identity && ocppModule.isChargerConnected(cpFull.ocpp_identity)) {
+            await ocppModule.sendRemoteStop(cpFull.ocpp_identity, session.id);
+            console.log('[TIMEOUT] OCPP RemoteStop sent to ' + cpFull.ocpp_identity);
+          } else {
+            console.log('[TIMEOUT] OCPP charger not connected — skipping RemoteStop');
+          }
+        } catch (ocppErr) {
+          console.error('[TIMEOUT] OCPP RemoteStop failed:', ocppErr.message);
+        }
       }
 
       // Get latest telemetry for final kWh
@@ -199,7 +220,6 @@ async function checkSessionTimeouts() {
       const startKwh = parseFloat(session.start_kwh_reading ?? 0);
       const kwhConsumed = parseFloat(Math.max(0, finalKwh - startKwh).toFixed(4));
 
-      // Update session
       await supabase.from('sessions').update({
         status: 'completed',
         kwh_consumed: kwhConsumed,
@@ -207,12 +227,10 @@ async function checkSessionTimeouts() {
         stopped_at: new Date().toISOString()
       }).eq('id', session.id);
 
-      // Reset charge point
       if (cp?.id) {
         await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
       }
 
-      // Billing
       const ratePerKwh = parseFloat(session.rate_per_kwh);
       const siteHostRate = parseFloat(site?.site_host_rate_per_kwh ?? 0);
       const evfloFee = parseFloat(site?.evflo_fee_per_kwh ?? 0);
@@ -255,7 +273,6 @@ async function checkSessionTimeouts() {
         });
         console.log('[TIMEOUT] Transaction recorded: ' + kwhConsumed + ' kWh — $' + (totalCents / 100).toFixed(2));
       } else {
-        // $0 session — cancel PI
         if (STRIPE_ENABLED && stripe && session.stripe_payment_intent_id) {
           try {
             await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
@@ -264,7 +281,6 @@ async function checkSessionTimeouts() {
         }
       }
 
-      // Clean up activeSessions
       if (deviceId) delete activeSessions[deviceId];
       console.log('[TIMEOUT] Session ' + session.id + ' auto-stopped.');
     }
