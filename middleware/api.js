@@ -50,13 +50,16 @@ app.get('/health', (req, res) => res.json({ status: 'ok', stripe: STRIPE_ENABLED
 app.get('/api/charger/:chargePointId', async (req, res) => {
   try {
     const { data: cp, error } = await supabase.from('charge_points')
-      .select('id, device_id, status, device_type, connector_type, max_power_kw, sites(id, name, address, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
+      .select('id, device_id, status, device_type, connector_type, max_power_kw, circuit_type, sites(id, name, address, rate_10a_per_kwh, rate_15a_per_kwh, rate_32a_per_kwh, evflo_fee_10a_per_kwh, evflo_fee_15a_per_kwh, evflo_fee_32a_per_kwh, currency)')
       .eq('device_id', req.params.chargePointId).eq('is_active', true).single();
     if (error || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
     const site = cp.sites;
-    const ratePerKwh = (parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh)).toFixed(2);
-    res.json({ chargePointId: cp.id, deviceId: cp.device_id, siteName: site.name, siteAddress: site.address, siteId: site.id, ratePerKwh, currency: site.currency, connectorType: cp.connector_type || 'gpo', maxPowerKw: parseFloat(cp.max_power_kw || 2.3) });
+    const circuit = cp.circuit_type || '10a';
+    const siteRate = parseFloat(site['rate_' + circuit + '_per_kwh'] || site.rate_10a_per_kwh);
+    const evfloFee = parseFloat(site['evflo_fee_' + circuit + '_per_kwh'] || site.evflo_fee_10a_per_kwh);
+    const ratePerKwh = (siteRate + evfloFee).toFixed(2);
+    res.json({ chargePointId: cp.id, deviceId: cp.device_id, siteName: site.name, siteAddress: site.address, siteId: site.id, ratePerKwh, currency: site.currency, connectorType: cp.connector_type || 'gpo', maxPowerKw: parseFloat(cp.max_power_kw || 2.3), circuitType: circuit });
   } catch (err) { console.error('[API] GET /charger error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -97,14 +100,15 @@ app.post('/api/sessions/start', async (req, res) => {
     if (STRIPE_ENABLED && !jwtUserId && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
 
     const { data: cp, error: cpError } = await supabase.from('charge_points')
-      .select('id, device_id, status, device_type, ocpp_identity, free_charge_emails, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
+      .select('id, device_id, status, device_type, ocpp_identity, free_charge_emails, circuit_type, sites(id, rate_10a_per_kwh, rate_15a_per_kwh, rate_32a_per_kwh, evflo_fee_10a_per_kwh, evflo_fee_15a_per_kwh, evflo_fee_32a_per_kwh, currency)')
       .eq('device_id', chargePointId).eq('is_active', true).single();
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
 
     const site = cp.sites;
-    const ratePerKwh = parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh);
-    const evfloMargin = parseFloat(site.evflo_fee_per_kwh);
+    const circuit = cp.circuit_type || '10a';
+    const ratePerKwh = parseFloat(site['rate_' + circuit + '_per_kwh'] || site.rate_10a_per_kwh) + parseFloat(site['evflo_fee_' + circuit + '_per_kwh'] || site.evflo_fee_10a_per_kwh);
+    const evfloMargin = parseFloat(site['evflo_fee_' + circuit + '_per_kwh'] || site.evflo_fee_10a_per_kwh);
 
     const { data: user, error: userError } = await supabase.from('users')
       .upsert({ email: effectiveEmail }, { onConflict: 'email' }).select('id, email, stripe_customer_id, stripe_default_pm, has_saved_card').single();
@@ -218,7 +222,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
   try {
     const { sessionId } = req.params;
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .select('id, user_id, status, rate_per_kwh, evflo_margin, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, device_type, ocpp_identity, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency))')
+      .select('id, user_id, status, rate_per_kwh, evflo_margin, start_kwh_reading, stripe_payment_intent_id, charge_points(id, device_id, device_type, ocpp_identity, circuit_type, sites(id, rate_10a_per_kwh, rate_15a_per_kwh, rate_32a_per_kwh, evflo_fee_10a_per_kwh, evflo_fee_15a_per_kwh, evflo_fee_32a_per_kwh, currency))')
       .eq('id', sessionId).single();
     if (sessionError || !session) return res.status(404).json({ error: 'Session not found' });
     if (session.status !== 'active') return res.status(409).json({ error: 'Session is ' + session.status });
@@ -235,8 +239,9 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     await supabase.from('sessions').update({ status: 'completed', kwh_consumed: kwhConsumed, final_kwh_reading: finalKwh, stopped_at: new Date().toISOString() }).eq('id', sessionId);
     await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
     const ratePerKwh = parseFloat(session.rate_per_kwh);
-    const siteHostRate = parseFloat(site.site_host_rate_per_kwh);
-    const evfloFee = parseFloat(site.evflo_fee_per_kwh);
+    const circuit = cp.circuit_type || '10a';
+    const siteHostRate = parseFloat(site['rate_' + circuit + '_per_kwh'] || site.rate_10a_per_kwh);
+    const evfloFee = parseFloat(site['evflo_fee_' + circuit + '_per_kwh'] || site.evflo_fee_10a_per_kwh);
     const totalCents = Math.round(kwhConsumed * ratePerKwh * 100);
     const siteHostCents = Math.round(kwhConsumed * siteHostRate * 100);
     const evfloFeeCents = totalCents - siteHostCents;
@@ -403,11 +408,11 @@ app.get('/api/admin/sites/:siteId/charge-points', adminAuth, async (req, res) =>
 });
 
 app.post('/api/admin/charge-points', adminAuth, async (req, res) => {
-  const { siteId, deviceId, label, deviceType, ocppIdentity, maxPowerKw, connectorType } = req.body;
+  const { siteId, deviceId, label, deviceType, ocppIdentity, maxPowerKw, connectorType, circuitType } = req.body;
   if (!siteId || !deviceId) return res.status(400).json({ error: 'siteId and deviceId are required' });
   const type = deviceType || 'shelly';
   if (type === 'ocpp' && !ocppIdentity) return res.status(400).json({ error: 'ocppIdentity required for OCPP devices' });
-  const { data, error } = await supabase.from('charge_points').insert({ site_id: siteId, device_id: deviceId, label: label || null, status: 'available', device_type: type, ocpp_identity: type === 'ocpp' ? ocppIdentity : null, max_power_kw: maxPowerKw || (type === 'ocpp' ? 7.4 : 2.3), connector_type: connectorType || (type === 'ocpp' ? 'type2_socket' : 'gpo') }).select().single();
+  const { data, error } = await supabase.from('charge_points').insert({ site_id: siteId, device_id: deviceId, label: label || null, status: 'available', device_type: type, ocpp_identity: type === 'ocpp' ? ocppIdentity : null, max_power_kw: maxPowerKw || (type === 'ocpp' ? 7.4 : 2.3), connector_type: connectorType || (type === 'ocpp' ? 'type2_socket' : 'gpo'), circuit_type: circuitType || (type === 'ocpp' ? '32a' : '10a') }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -425,12 +430,18 @@ app.post('/api/admin/sites', adminAuth, async (req, res) => {
 // ─── PATCH /api/admin/sites/:siteId ───────────────────────────────────────────
 app.patch('/api/admin/sites/:siteId', adminAuth, async (req, res) => {
   try {
-    const { name, street, suburb, postcode, state, type, siteHostRatePerKwh, evfloFeePerKwh } = req.body;
+    const { name, street, suburb, postcode, state, type, siteHostRatePerKwh, evfloFeePerKwh, rate10a, rate15a, rate32a, evfloFee10a, evfloFee15a, evfloFee32a } = req.body;
     const updateObj = {};
     if (name !== undefined) updateObj.name = name;
     if (type !== undefined) updateObj.type = type;
     if (siteHostRatePerKwh !== undefined) updateObj.site_host_rate_per_kwh = siteHostRatePerKwh;
     if (evfloFeePerKwh !== undefined) updateObj.evflo_fee_per_kwh = evfloFeePerKwh;
+    if (rate10a !== undefined) updateObj.rate_10a_per_kwh = rate10a;
+    if (rate15a !== undefined) updateObj.rate_15a_per_kwh = rate15a;
+    if (rate32a !== undefined) updateObj.rate_32a_per_kwh = rate32a;
+    if (evfloFee10a !== undefined) updateObj.evflo_fee_10a_per_kwh = evfloFee10a;
+    if (evfloFee15a !== undefined) updateObj.evflo_fee_15a_per_kwh = evfloFee15a;
+    if (evfloFee32a !== undefined) updateObj.evflo_fee_32a_per_kwh = evfloFee32a;
     if (street !== undefined) updateObj.street = street;
     if (suburb !== undefined) updateObj.suburb = suburb;
     if (postcode !== undefined) updateObj.postcode = postcode;
@@ -453,7 +464,7 @@ app.patch('/api/admin/sites/:siteId', adminAuth, async (req, res) => {
 // ─── PATCH /api/admin/charge-points/:chargePointId ────────────────────────────
 app.patch('/api/admin/charge-points/:chargePointId', adminAuth, async (req, res) => {
   try {
-    const { label, deviceId, deviceType, ocppIdentity, maxPowerKw, connectorType, freeChargeEmails } = req.body;
+    const { label, deviceId, deviceType, ocppIdentity, maxPowerKw, connectorType, freeChargeEmails, circuitType } = req.body;
     const updateObj = {};
     if (label !== undefined) updateObj.label = label;
     if (deviceId !== undefined) updateObj.device_id = deviceId;
@@ -462,6 +473,7 @@ app.patch('/api/admin/charge-points/:chargePointId', adminAuth, async (req, res)
     if (maxPowerKw !== undefined) updateObj.max_power_kw = maxPowerKw;
     if (connectorType !== undefined) updateObj.connector_type = connectorType;
     if (freeChargeEmails !== undefined) updateObj.free_charge_emails = freeChargeEmails;
+    if (circuitType !== undefined) updateObj.circuit_type = circuitType;
     if (Object.keys(updateObj).length === 0) return res.status(400).json({ error: 'No fields to update' });
     const { data, error } = await supabase.from('charge_points').update(updateObj).eq('id', req.params.chargePointId).eq('is_active', true).select().single();
     if (error || !data) return res.status(404).json({ error: 'Charge point not found' });
