@@ -57,7 +57,7 @@ export default function Stop() {
 
   const handleDone = () => {
     navigate(`/receipt/${chargePointId}`, {
-      state: { email, kwh: finalKwh, cost: finalCost, elapsed }
+      state: { email, kwh: finalKwh, cost: finalCost, elapsed, sessionId}
     });
   };
 
