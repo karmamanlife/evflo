@@ -15,7 +15,7 @@ if (STRIPE_ENABLED) {
 
 const PRE_AUTH_AMOUNT_CENTS = parseInt(process.env.PRE_AUTH_AMOUNT_CENTS || '2500');
 
-app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type', 'x-admin-key', 'Authorization'] }));
+app.use(cors({ origin: 'https://evflo.com.au', methods: ['GET', 'POST', 'PATCH', 'DELETE'], allowedHeaders: ['Content-Type', 'x-admin-key', 'Authorization'] }));
 app.use(express.json());
 
 let mqttClient = null;
@@ -26,45 +26,23 @@ function setMqttClient(client, deviceMap, deviceState) { mqttClient = client; de
 function setOcppModule(ocpp) { ocppModule = ocpp; }
 
 // ─── Command Router (F17) ──────────────────────────────────────────────────────
-// Abstracts hardware communication. Checks device_type and dispatches accordingly.
-// For Shelly: MQTT publish (existing behaviour, unchanged).
-// For OCPP: RemoteStartTransaction / RemoteStopTransaction via WebSocket.
-
 async function sendChargeCommand(chargePoint, action, sessionId) {
   const deviceType = chargePoint.device_type || 'shelly';
   const deviceId = chargePoint.device_id;
-
   if (deviceType === 'shelly') {
-    // ── Shelly/MQTT path — identical to original code ──
     if (mqttClient) {
       const command = action === 'start' ? 'on' : 'off';
       mqttClient.publish('shelly1pmg4-' + deviceId + '/command/switch:0', command);
       console.log('[CMD] MQTT relay ' + command.toUpperCase() + ' → ' + deviceId);
-    } else {
-      console.error('[CMD] MQTT client not available for ' + deviceId);
-    }
+    } else { console.error('[CMD] MQTT client not available for ' + deviceId); }
   } else if (deviceType === 'ocpp') {
-    // ── OCPP path — WebSocket command via ocpp.js ──
-    if (!ocppModule) {
-      throw new Error('OCPP module not initialised');
-    }
+    if (!ocppModule) throw new Error('OCPP module not initialised');
     const ocppIdentity = chargePoint.ocpp_identity;
-    if (!ocppIdentity) {
-      throw new Error('No ocpp_identity configured for charge point ' + deviceId);
-    }
-    if (!ocppModule.isChargerConnected(ocppIdentity)) {
-      throw new Error('OCPP charger ' + ocppIdentity + ' is not connected');
-    }
-    if (action === 'start') {
-      await ocppModule.sendRemoteStart(ocppIdentity, 'EVFLO');
-      console.log('[CMD] OCPP RemoteStart → ' + ocppIdentity);
-    } else {
-      await ocppModule.sendRemoteStop(ocppIdentity, sessionId);
-      console.log('[CMD] OCPP RemoteStop → ' + ocppIdentity);
-    }
-  } else {
-    throw new Error('Unknown device_type: ' + deviceType);
-  }
+    if (!ocppIdentity) throw new Error('No ocpp_identity configured for charge point ' + deviceId);
+    if (!ocppModule.isChargerConnected(ocppIdentity)) throw new Error('OCPP charger ' + ocppIdentity + ' is not connected');
+    if (action === 'start') { await ocppModule.sendRemoteStart(ocppIdentity, 'EVFLO'); console.log('[CMD] OCPP RemoteStart → ' + ocppIdentity); }
+    else { await ocppModule.sendRemoteStop(ocppIdentity, sessionId); console.log('[CMD] OCPP RemoteStop → ' + ocppIdentity); }
+  } else { throw new Error('Unknown device_type: ' + deviceType); }
 }
 
 app.get('/health', (req, res) => res.json({ status: 'ok', stripe: STRIPE_ENABLED }));
@@ -73,22 +51,12 @@ app.get('/api/charger/:chargePointId', async (req, res) => {
   try {
     const { data: cp, error } = await supabase.from('charge_points')
       .select('id, device_id, status, device_type, connector_type, max_power_kw, sites(id, name, address, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
-      .eq('device_id', req.params.chargePointId).single();
+      .eq('device_id', req.params.chargePointId).eq('is_active', true).single();
     if (error || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
     const site = cp.sites;
     const ratePerKwh = (parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh)).toFixed(2);
-    res.json({
-      chargePointId: cp.id,
-      deviceId: cp.device_id,
-      siteName: site.name,
-      siteAddress: site.address,
-      siteId: site.id,
-      ratePerKwh,
-      currency: site.currency,
-      connectorType: cp.connector_type || 'gpo',
-      maxPowerKw: parseFloat(cp.max_power_kw || 2.3)
-    });
+    res.json({ chargePointId: cp.id, deviceId: cp.device_id, siteName: site.name, siteAddress: site.address, siteId: site.id, ratePerKwh, currency: site.currency, connectorType: cp.connector_type || 'gpo', maxPowerKw: parseFloat(cp.max_power_kw || 2.3) });
   } catch (err) { console.error('[API] GET /charger error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
@@ -104,15 +72,7 @@ app.post('/api/sessions/create-payment-intent', async (req, res) => {
       customerId = customer.id;
       if (userForPi?.id) await supabase.from('users').update({ stripe_customer_id: customerId }).eq('id', userForPi.id);
     }
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: PRE_AUTH_AMOUNT_CENTS,
-      currency: 'aud',
-      capture_method: 'manual',
-      customer: customerId,
-      setup_future_usage: 'off_session',
-      description: 'EVFLO charging session pre-authorisation',
-      metadata: { email }
-    });
+    const paymentIntent = await stripe.paymentIntents.create({ amount: PRE_AUTH_AMOUNT_CENTS, currency: 'aud', capture_method: 'manual', customer: customerId, setup_future_usage: 'off_session', description: 'EVFLO charging session pre-authorisation', metadata: { email } });
     console.log('[API] PaymentIntent created: ' + paymentIntent.id + ' — $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' hold');
     res.json({ clientSecret: paymentIntent.client_secret, paymentIntentId: paymentIntent.id });
   } catch (err) { console.error('[API] create-payment-intent error:', err.message); res.status(500).json({ error: 'Failed to create payment intent' }); }
@@ -121,8 +81,6 @@ app.post('/api/sessions/create-payment-intent', async (req, res) => {
 app.post('/api/sessions/start', async (req, res) => {
   try {
     const { chargePointId, email, paymentIntentId } = req.body;
-
-    // F14: check for JWT auth (returning user with saved card)
     const authHeader = req.headers['authorization'];
     let jwtUserId = null;
     let jwtEmail = null;
@@ -132,20 +90,15 @@ app.post('/api/sessions/start', async (req, res) => {
         const decoded = jwt.verify(authHeader.slice(7), process.env.JWT_SECRET);
         jwtUserId = decoded.userId;
         jwtEmail = decoded.email;
-      } catch (e) {
-        return res.status(401).json({ error: 'Invalid or expired token. Please request a new magic link.' });
-      }
+      } catch (e) { return res.status(401).json({ error: 'Invalid or expired token. Please request a new magic link.' }); }
     }
-
     const effectiveEmail = jwtEmail || email;
     if (!chargePointId || !effectiveEmail) return res.status(400).json({ error: 'chargePointId and email required' });
-
-    // Guest flow requires paymentIntentId; JWT flow does not
     if (STRIPE_ENABLED && !jwtUserId && !paymentIntentId) return res.status(400).json({ error: 'paymentIntentId required' });
 
     const { data: cp, error: cpError } = await supabase.from('charge_points')
-      .select('id, device_id, status, device_type, ocpp_identity, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
-      .eq('device_id', chargePointId).single();
+      .select('id, device_id, status, device_type, ocpp_identity, free_charge_emails, sites(id, site_host_rate_per_kwh, evflo_fee_per_kwh, currency)')
+      .eq('device_id', chargePointId).eq('is_active', true).single();
     if (cpError || !cp) return res.status(404).json({ error: 'Charger not found' });
     if (cp.status !== 'available') return res.status(409).json({ error: 'Charger not available' });
 
@@ -153,44 +106,43 @@ app.post('/api/sessions/start', async (req, res) => {
     const ratePerKwh = parseFloat(site.site_host_rate_per_kwh) + parseFloat(site.evflo_fee_per_kwh);
     const evfloMargin = parseFloat(site.evflo_fee_per_kwh);
 
-    // Upsert user
     const { data: user, error: userError } = await supabase.from('users')
       .upsert({ email: effectiveEmail }, { onConflict: 'email' }).select('id, email, stripe_customer_id, stripe_default_pm, has_saved_card').single();
     if (userError) throw new Error('User upsert failed: ' + userError.message);
 
+    // ── FREE CHARGING CHECK ──
+    if (jwtUserId) {
+      const freeEmails = (cp.free_charge_emails || []).map(e => e.toLowerCase());
+      if (freeEmails.includes(effectiveEmail.toLowerCase())) {
+        const startKwh = (cp.device_type === 'shelly' && deviceStateCache[cp.device_id]) ? deviceStateCache[cp.device_id].kwh : 0;
+        const { data: freeSession, error: freeSessionError } = await supabase.from('sessions')
+          .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: 0, evflo_margin: 0, started_at: new Date().toISOString(), start_kwh_reading: startKwh, stripe_payment_intent_id: null }).select('id').single();
+        if (freeSessionError) throw new Error('Free session create failed: ' + freeSessionError.message);
+        await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
+        try { await sendChargeCommand(cp, 'start'); } catch (cmdErr) {
+          console.error('[API] Free session charge command failed:', cmdErr.message);
+          await supabase.from('sessions').update({ status: 'cancelled', stopped_at: new Date().toISOString() }).eq('id', freeSession.id);
+          await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
+          return res.status(503).json({ error: 'Charger not responding. Please try again.' });
+        }
+        console.log('[API] FREE session started: ' + freeSession.id + ' — ' + effectiveEmail);
+        return res.json({ sessionId: freeSession.id, status: 'active', startedAt: new Date().toISOString(), ratePerKwh: '0.00', freeCharge: true });
+      }
+    }
+
     let effectivePaymentIntentId = paymentIntentId || null;
 
     if (jwtUserId) {
-      // ── RETURNING USER: use saved card to create a new PaymentIntent ──
       if (!STRIPE_ENABLED) return res.status(400).json({ error: 'Stripe not enabled' });
-      if (!user.stripe_customer_id || !user.stripe_default_pm) {
-        return res.status(402).json({ error: 'No saved card on file. Please start a new session.' });
-      }
-      const pi = await stripe.paymentIntents.create({
-        amount: PRE_AUTH_AMOUNT_CENTS,
-        currency: 'aud',
-        capture_method: 'manual',
-        customer: user.stripe_customer_id,
-        payment_method: user.stripe_default_pm,
-        confirm: true,
-        off_session: true,
-        description: 'EVFLO charging session pre-authorisation (returning user)',
-        metadata: { email: effectiveEmail, evflo_user_id: user.id }
-      });
-      if (pi.status !== 'requires_capture') {
-        return res.status(402).json({ error: 'Card authorisation failed. Please use a different card.' });
-      }
+      if (!user.stripe_customer_id || !user.stripe_default_pm) return res.status(402).json({ error: 'No saved card on file. Please start a new session.' });
+      const pi = await stripe.paymentIntents.create({ amount: PRE_AUTH_AMOUNT_CENTS, currency: 'aud', capture_method: 'manual', customer: user.stripe_customer_id, payment_method: user.stripe_default_pm, confirm: true, off_session: true, description: 'EVFLO charging session pre-authorisation (returning user)', metadata: { email: effectiveEmail, evflo_user_id: user.id } });
+      if (pi.status !== 'requires_capture') return res.status(402).json({ error: 'Card authorisation failed. Please use a different card.' });
       effectivePaymentIntentId = pi.id;
       console.log('[API] Returning user PI created: ' + pi.id);
     } else {
-      // ── GUEST FLOW: verify the PI they confirmed on the frontend ──
       if (STRIPE_ENABLED && paymentIntentId) {
         const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
-        if (pi.status !== 'requires_capture') {
-          return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
-        }
-
-        // Attach PM to Customer so save-card works later
+        if (pi.status !== 'requires_capture') return res.status(402).json({ error: 'Payment not confirmed. Please complete card authorisation.' });
         try {
           const pmId = pi.payment_method;
           if (pmId) {
@@ -205,45 +157,22 @@ app.post('/api/sessions/start', async (req, res) => {
             await supabase.from('users').update({ stripe_default_pm: pmId }).eq('id', user.id);
             console.log('[API] PM attached to customer at session start for user', user.id);
           }
-        } catch (attachErr) {
-          // Non-fatal — log but don't block session start
-          console.error('[API] PM attach warning (non-fatal):', attachErr.message);
-        }
+        } catch (attachErr) { console.error('[API] PM attach warning (non-fatal):', attachErr.message); }
       }
     }
 
-    // For Shelly devices, use cached kWh. For OCPP, start_kwh_reading is updated by StartTransaction handler.
-    const startKwh = (cp.device_type === 'shelly' && deviceStateCache[cp.device_id])
-      ? deviceStateCache[cp.device_id].kwh
-      : 0;
-
+    const startKwh = (cp.device_type === 'shelly' && deviceStateCache[cp.device_id]) ? deviceStateCache[cp.device_id].kwh : 0;
     const { data: session, error: sessionError } = await supabase.from('sessions')
-      .insert({
-        charge_point_id: cp.id,
-        user_id: user.id,
-        status: 'active',
-        rate_per_kwh: ratePerKwh,
-        evflo_margin: evfloMargin,
-        started_at: new Date().toISOString(),
-        start_kwh_reading: startKwh,
-        stripe_payment_intent_id: effectivePaymentIntentId
-      })
+      .insert({ charge_point_id: cp.id, user_id: user.id, status: 'active', rate_per_kwh: ratePerKwh, evflo_margin: evfloMargin, started_at: new Date().toISOString(), start_kwh_reading: startKwh, stripe_payment_intent_id: effectivePaymentIntentId })
       .select('id').single();
     if (sessionError) throw new Error('Session create failed: ' + sessionError.message);
-
     await supabase.from('charge_points').update({ status: 'occupied' }).eq('id', cp.id);
 
-    // ── Command Router: send start command to hardware ──
-    try {
-      await sendChargeCommand(cp, 'start');
-    } catch (cmdErr) {
-      // If OCPP charger rejects or is offline, roll back session
+    try { await sendChargeCommand(cp, 'start'); } catch (cmdErr) {
       console.error('[API] Charge command failed:', cmdErr.message);
       await supabase.from('sessions').update({ status: 'cancelled', stopped_at: new Date().toISOString() }).eq('id', session.id);
       await supabase.from('charge_points').update({ status: 'available' }).eq('id', cp.id);
-      if (STRIPE_ENABLED && effectivePaymentIntentId) {
-        try { await stripe.paymentIntents.cancel(effectivePaymentIntentId); } catch (e) { /* best effort */ }
-      }
+      if (STRIPE_ENABLED && effectivePaymentIntentId) { try { await stripe.paymentIntents.cancel(effectivePaymentIntentId); } catch (e) { /* best effort */ } }
       return res.status(503).json({ error: 'Charger not responding. Please try again.' });
     }
 
@@ -271,7 +200,6 @@ app.get('/api/sessions/:sessionId', async (req, res) => {
   } catch (err) { console.error('[API] GET /sessions/:id error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
 
-// Helper: re-attach PM to customer after a PI is cancelled (Stripe detaches on cancel)
 async function reattachPmAfterCancel(userId, paymentIntentId) {
   try {
     const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_default_pm').eq('id', userId).single();
@@ -280,15 +208,10 @@ async function reattachPmAfterCancel(userId, paymentIntentId) {
       await stripe.paymentMethods.attach(user.stripe_default_pm, { customer: user.stripe_customer_id });
       console.log('[API] PM re-attached after cancel for user', userId);
     } catch (e) {
-      if (e.code === 'payment_method_already_attached') {
-        console.log('[API] PM already attached — no action needed');
-      } else {
-        console.error('[API] PM re-attach failed:', e.message);
-      }
+      if (e.code === 'payment_method_already_attached') { console.log('[API] PM already attached — no action needed'); }
+      else { console.error('[API] PM re-attach failed:', e.message); }
     }
-  } catch (e) {
-    console.error('[API] reattachPmAfterCancel error:', e.message);
-  }
+  } catch (e) { console.error('[API] reattachPmAfterCancel error:', e.message); }
 }
 
 app.post('/api/sessions/:sessionId/stop', async (req, res) => {
@@ -302,13 +225,7 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     const cp = session.charge_points;
     const site = cp.sites;
 
-    // ── Command Router: send stop command to hardware ──
-    try {
-      await sendChargeCommand(cp, 'stop', sessionId);
-    } catch (cmdErr) {
-      // Log but don't block stop — we still need to bill and release the charge point
-      console.error('[API] Stop command warning (non-fatal):', cmdErr.message);
-    }
+    try { await sendChargeCommand(cp, 'stop', sessionId); } catch (cmdErr) { console.error('[API] Stop command warning (non-fatal):', cmdErr.message); }
 
     const { data: finalTelemetry } = await supabase.from('session_telemetry')
       .select('kwh_total').eq('session_id', sessionId).order('recorded_at', { ascending: false }).limit(1).single();
@@ -325,28 +242,35 @@ app.post('/api/sessions/:sessionId/stop', async (req, res) => {
     const evfloFeeCents = totalCents - siteHostCents;
     let stripeChargeStatus = 'pending';
     let transactionId = null;
+
+    // Free session: no Stripe, always create $0 transaction for audit trail
+    if (!session.stripe_payment_intent_id) {
+      stripeChargeStatus = 'succeeded';
+      const { data: txn, error: txnError } = await supabase.from('transactions')
+        .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: 0, site_host_amount_cents: 0, evflo_fee_cents: 0, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: parseFloat(site.site_host_rate_per_kwh), evflo_fee_per_kwh: parseFloat(site.evflo_fee_per_kwh), stripe_payment_intent_id: null, stripe_charge_status: 'succeeded', metadata: { billing_type: 'free', kwh_consumed: kwhConsumed } })
+        .select('id').single();
+      if (txnError) console.error('[API] Free transaction insert failed:', txnError.message);
+      else transactionId = txn.id;
+      console.log('[API] FREE session stopped: ' + sessionId + ' — ' + kwhConsumed + ' kWh — $0.00');
+      return res.json({ sessionId, status: 'completed', kwhConsumed, totalAmountCents: 0, totalAmountAud: '0.00', ratePerKwh: '0.00', transactionId, currency: 'AUD', stripeStatus: 'succeeded', freeCharge: true });
+    }
+
     if (kwhConsumed > 0) {
       if (STRIPE_ENABLED && session.stripe_payment_intent_id) {
         try {
           if (totalCents >= 50) {
             let captureCents = totalCents;
-            if (totalCents > PRE_AUTH_AMOUNT_CENTS) {
-              console.log('[API] WARNING: Capture amount $' + (totalCents / 100).toFixed(2) + ' exceeds pre-auth $' + (PRE_AUTH_AMOUNT_CENTS / 100).toFixed(2) + ' — capping at pre-auth amount');
-              captureCents = PRE_AUTH_AMOUNT_CENTS;
-            }
+            if (totalCents > PRE_AUTH_AMOUNT_CENTS) { console.log('[API] WARNING: capping capture at pre-auth'); captureCents = PRE_AUTH_AMOUNT_CENTS; }
             await stripe.paymentIntents.capture(session.stripe_payment_intent_id, { amount_to_capture: captureCents });
             stripeChargeStatus = 'succeeded';
-            console.log('[API] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (captureCents / 100).toFixed(2) + (totalCents > PRE_AUTH_AMOUNT_CENTS ? ' (capped from $' + (totalCents / 100).toFixed(2) + ')' : ''));
+            console.log('[API] Stripe captured: ' + session.stripe_payment_intent_id + ' — $' + (captureCents / 100).toFixed(2));
           } else {
             await stripe.paymentIntents.cancel(session.stripe_payment_intent_id);
             stripeChargeStatus = 'cancelled';
             console.log('[API] Stripe cancelled (amount < $0.50): ' + session.stripe_payment_intent_id);
             await reattachPmAfterCancel(session.user_id, session.stripe_payment_intent_id);
           }
-        } catch (stripeErr) {
-          stripeChargeStatus = 'failed';
-          console.error('[API] Stripe capture failed:', stripeErr.message);
-        }
+        } catch (stripeErr) { stripeChargeStatus = 'failed'; console.error('[API] Stripe capture failed:', stripeErr.message); }
       }
       const { data: txn, error: txnError } = await supabase.from('transactions')
         .insert({ session_id: sessionId, user_id: session.user_id, site_id: site.id, type: 'charge', total_amount_cents: totalCents, site_host_amount_cents: siteHostCents, evflo_fee_cents: evfloFeeCents, currency: 'AUD', kwh_consumed: kwhConsumed, site_host_rate_per_kwh: siteHostRate, evflo_fee_per_kwh: evfloFee, stripe_payment_intent_id: session.stripe_payment_intent_id, stripe_charge_status: stripeChargeStatus, metadata: { kwh_consumed: kwhConsumed, rate_per_kwh: ratePerKwh, total_aud: (totalCents / 100).toFixed(2), capture_capped: totalCents > PRE_AUTH_AMOUNT_CENTS, original_amount_cents: totalCents } })
@@ -402,16 +326,8 @@ app.post('/api/auth/send-magic-link', async (req, res) => {
     const { Resend } = require('resend');
     const resend = new Resend(process.env.RESEND_API_KEY);
     const magicLink = 'https://evflo.com.au/auth/verify?token=' + token;
-    const { data: emailData, error: emailError } = await resend.emails.send({
-      from: 'EVFLO <noreply@evflo.com.au>',
-      to: email,
-      subject: 'EVFLO — Tap to start charging',
-      html: '<p>Hi,</p><p>Tap the link below to start your charging session. This link expires in 15 minutes.</p><p><a href="' + magicLink + '" style="background:#22c55e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;">Start Charging</a></p><p>If you did not request this, ignore this email.</p>'
-    });
-    if (emailError) {
-      console.error('[API] Resend error:', JSON.stringify(emailError));
-      return res.status(500).json({ error: 'Failed to send magic link email' });
-    }
+    const { data: emailData, error: emailError } = await resend.emails.send({ from: 'EVFLO <noreply@evflo.com.au>', to: email, subject: 'EVFLO — Tap to start charging', html: '<p>Hi,</p><p>Tap the link below to start your charging session. This link expires in 15 minutes.</p><p><a href="' + magicLink + '" style="background:#22c55e;color:white;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:bold;">Start Charging</a></p><p>If you did not request this, ignore this email.</p>' });
+    if (emailError) { console.error('[API] Resend error:', JSON.stringify(emailError)); return res.status(500).json({ error: 'Failed to send magic link email' }); }
     console.log('[API] Magic link sent to', email, '— Resend ID:', emailData?.id);
     res.json({ sent: true });
   } catch (err) { console.error('[API] send-magic-link error:', err.message); res.status(500).json({ error: err.message }); }
@@ -431,10 +347,8 @@ app.get('/api/auth/verify', async (req, res) => {
     const pmId = authToken.user.stripe_default_pm;
     let last4 = null;
     if (pmId && STRIPE_ENABLED) {
-      try {
-        const pm = await stripe.paymentMethods.retrieve(pmId);
-        last4 = pm.card ? pm.card.last4 : null;
-      } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
+      try { const pm = await stripe.paymentMethods.retrieve(pmId); last4 = pm.card ? pm.card.last4 : null; }
+      catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
     }
     const chargePointId = authToken.charge_point_id;
     const redirectUrl = 'https://evflo.com.au/start/' + (chargePointId || 'EVFLO-01') + '?jwt=' + jwtToken + (last4 ? '&last4=' + last4 : '');
@@ -454,10 +368,8 @@ app.post('/api/user/save-card', async (req, res) => {
     await supabase.from('users').update({ has_saved_card: true }).eq('id', user.id);
     let last4 = null;
     if (STRIPE_ENABLED && user.stripe_default_pm) {
-      try {
-        const pm = await stripe.paymentMethods.retrieve(user.stripe_default_pm);
-        last4 = pm.card ? pm.card.last4 : null;
-      } catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
+      try { const pm = await stripe.paymentMethods.retrieve(user.stripe_default_pm); last4 = pm.card ? pm.card.last4 : null; }
+      catch (e) { console.error('[API] Could not retrieve PM last4:', e.message); }
     }
     const jwt = require('jsonwebtoken');
     const jwtToken = jwt.sign({ userId: user.id, email: user.email }, process.env.JWT_SECRET, { expiresIn: '24h' });
@@ -479,13 +391,13 @@ const adminAuth = (req, res, next) => {
 };
 
 app.get('/api/admin/sites', adminAuth, async (req, res) => {
-  const { data, error } = await supabase.from('sites').select('*').order('created_at');
+  const { data, error } = await supabase.from('sites').select('*').eq('is_active', true).order('created_at');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
 
 app.get('/api/admin/sites/:siteId/charge-points', adminAuth, async (req, res) => {
-  const { data, error } = await supabase.from('charge_points').select('*').eq('site_id', req.params.siteId).order('created_at');
+  const { data, error } = await supabase.from('charge_points').select('*').eq('site_id', req.params.siteId).eq('is_active', true).order('created_at');
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -493,21 +405,9 @@ app.get('/api/admin/sites/:siteId/charge-points', adminAuth, async (req, res) =>
 app.post('/api/admin/charge-points', adminAuth, async (req, res) => {
   const { siteId, deviceId, label, deviceType, ocppIdentity, maxPowerKw, connectorType } = req.body;
   if (!siteId || !deviceId) return res.status(400).json({ error: 'siteId and deviceId are required' });
-
-  // Validate OCPP fields
   const type = deviceType || 'shelly';
   if (type === 'ocpp' && !ocppIdentity) return res.status(400).json({ error: 'ocppIdentity required for OCPP devices' });
-
-  const { data, error } = await supabase.from('charge_points').insert({
-    site_id: siteId,
-    device_id: deviceId,
-    label: label || null,
-    status: 'available',
-    device_type: type,
-    ocpp_identity: type === 'ocpp' ? ocppIdentity : null,
-    max_power_kw: maxPowerKw || (type === 'ocpp' ? 7.4 : 2.3),
-    connector_type: connectorType || (type === 'ocpp' ? 'type2_socket' : 'gpo')
-  }).select().single();
+  const { data, error } = await supabase.from('charge_points').insert({ site_id: siteId, device_id: deviceId, label: label || null, status: 'available', device_type: type, ocpp_identity: type === 'ocpp' ? ocppIdentity : null, max_power_kw: maxPowerKw || (type === 'ocpp' ? 7.4 : 2.3), connector_type: connectorType || (type === 'ocpp' ? 'type2_socket' : 'gpo') }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
 });
@@ -517,18 +417,74 @@ app.post('/api/admin/sites', adminAuth, async (req, res) => {
   if (!name || !type) return res.status(400).json({ error: 'name and type are required' });
   const addressParts = [street, suburb, postcode, state].filter(Boolean);
   const address = addressParts.length > 0 ? addressParts.join(', ') : null;
-  const { data, error } = await supabase.from('sites').insert({
-    name,
-    address,
-    street: street || null,
-    suburb: suburb || null,
-    postcode: postcode || null,
-    state: state || null,
-    type,
-    site_host_rate_per_kwh: siteHostRatePerKwh || 0.35,
-    evflo_fee_per_kwh: evfloFeePerKwh || 0.10,
-    currency: 'AUD'
-  }).select().single();
+  const { data, error } = await supabase.from('sites').insert({ name, address, street: street || null, suburb: suburb || null, postcode: postcode || null, state: state || null, type, site_host_rate_per_kwh: siteHostRatePerKwh || 0.35, evflo_fee_per_kwh: evfloFeePerKwh || 0.10, currency: 'AUD' }).select().single();
   if (error) return res.status(500).json({ error: error.message });
   res.json(data);
+});
+
+// ─── PATCH /api/admin/sites/:siteId ───────────────────────────────────────────
+app.patch('/api/admin/sites/:siteId', adminAuth, async (req, res) => {
+  try {
+    const { name, street, suburb, postcode, state, type, siteHostRatePerKwh, evfloFeePerKwh } = req.body;
+    const updateObj = {};
+    if (name !== undefined) updateObj.name = name;
+    if (type !== undefined) updateObj.type = type;
+    if (siteHostRatePerKwh !== undefined) updateObj.site_host_rate_per_kwh = siteHostRatePerKwh;
+    if (evfloFeePerKwh !== undefined) updateObj.evflo_fee_per_kwh = evfloFeePerKwh;
+    if (street !== undefined) updateObj.street = street;
+    if (suburb !== undefined) updateObj.suburb = suburb;
+    if (postcode !== undefined) updateObj.postcode = postcode;
+    if (state !== undefined) updateObj.state = state;
+    if (street !== undefined || suburb !== undefined || postcode !== undefined || state !== undefined) {
+      const { data: existing } = await supabase.from('sites').select('street, suburb, postcode, state').eq('id', req.params.siteId).single();
+      const mergedStreet = street !== undefined ? street : existing?.street;
+      const mergedSuburb = suburb !== undefined ? suburb : existing?.suburb;
+      const mergedState = state !== undefined ? state : existing?.state;
+      const mergedPostcode = postcode !== undefined ? postcode : existing?.postcode;
+      updateObj.address = [mergedStreet, mergedSuburb, mergedState, mergedPostcode].filter(Boolean).join(', ') || null;
+    }
+    if (Object.keys(updateObj).length === 0) return res.status(400).json({ error: 'No fields to update' });
+    const { data, error } = await supabase.from('sites').update(updateObj).eq('id', req.params.siteId).eq('is_active', true).select().single();
+    if (error || !data) return res.status(404).json({ error: 'Site not found' });
+    res.json(data);
+  } catch (err) { console.error('[API] PATCH /admin/sites error:', err.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── PATCH /api/admin/charge-points/:chargePointId ────────────────────────────
+app.patch('/api/admin/charge-points/:chargePointId', adminAuth, async (req, res) => {
+  try {
+    const { label, deviceId, deviceType, ocppIdentity, maxPowerKw, connectorType, freeChargeEmails } = req.body;
+    const updateObj = {};
+    if (label !== undefined) updateObj.label = label;
+    if (deviceId !== undefined) updateObj.device_id = deviceId;
+    if (deviceType !== undefined) updateObj.device_type = deviceType;
+    if (ocppIdentity !== undefined) updateObj.ocpp_identity = ocppIdentity;
+    if (maxPowerKw !== undefined) updateObj.max_power_kw = maxPowerKw;
+    if (connectorType !== undefined) updateObj.connector_type = connectorType;
+    if (freeChargeEmails !== undefined) updateObj.free_charge_emails = freeChargeEmails;
+    if (Object.keys(updateObj).length === 0) return res.status(400).json({ error: 'No fields to update' });
+    const { data, error } = await supabase.from('charge_points').update(updateObj).eq('id', req.params.chargePointId).eq('is_active', true).select().single();
+    if (error || !data) return res.status(404).json({ error: 'Charge point not found' });
+    res.json(data);
+  } catch (err) { console.error('[API] PATCH /admin/charge-points error:', err.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── DELETE (soft) /api/admin/sites/:siteId ───────────────────────────────────
+app.delete('/api/admin/sites/:siteId', adminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('sites').update({ is_active: false }).eq('id', req.params.siteId).eq('is_active', true).select('id').single();
+    if (error || !data) return res.status(404).json({ error: 'Site not found' });
+    console.log('[API] Site soft-deleted:', req.params.siteId);
+    res.json({ deleted: true, id: data.id });
+  } catch (err) { console.error('[API] DELETE /admin/sites error:', err.message); res.status(500).json({ error: 'Server error' }); }
+});
+
+// ─── DELETE (soft) /api/admin/charge-points/:chargePointId ───────────────────
+app.delete('/api/admin/charge-points/:chargePointId', adminAuth, async (req, res) => {
+  try {
+    const { data, error } = await supabase.from('charge_points').update({ is_active: false }).eq('id', req.params.chargePointId).eq('is_active', true).select('id').single();
+    if (error || !data) return res.status(404).json({ error: 'Charge point not found' });
+    console.log('[API] Charge point soft-deleted:', req.params.chargePointId);
+    res.json({ deleted: true, id: data.id });
+  } catch (err) { console.error('[API] DELETE /admin/charge-points error:', err.message); res.status(500).json({ error: 'Server error' }); }
 });
