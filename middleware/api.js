@@ -327,7 +327,14 @@ app.post('/api/auth/send-magic-link', async (req, res) => {
     const crypto = require('crypto');
     const token = crypto.randomBytes(32).toString('hex');
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
-    await supabase.from('auth_tokens').insert({ user_id: user.id, token, charge_point_id: chargePointId || null, expires_at: expiresAt });
+    // Resolve chargePointId — frontend may send device_id string instead of UUID
+    let resolvedCpId = chargePointId || null;
+    if (resolvedCpId && !resolvedCpId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
+      const { data: cpLookup } = await supabase.from('charge_points').select('id').eq('device_id', resolvedCpId).single();
+      resolvedCpId = cpLookup ? cpLookup.id : null;
+    }
+    const { error: insertError } = await supabase.from('auth_tokens').insert({ user_id: user.id, token, charge_point_id: resolvedCpId, expires_at: expiresAt });
+    if (insertError) console.error('[API] auth_tokens insert error:', JSON.stringify(insertError));
     const { Resend } = require('resend');
     const resend = new Resend(process.env.RESEND_API_KEY);
     const magicLink = 'https://evflo.com.au/auth/verify?token=' + token;
@@ -339,8 +346,22 @@ app.post('/api/auth/send-magic-link', async (req, res) => {
 });
 
 app.get('/api/auth/verify', async (req, res) => {
+  // GET only validates — does NOT consume token (prevents email prefetch bug)
   try {
     const { token } = req.query;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+    const { data: authToken, error } = await supabase.from('auth_tokens').select('id, used, expires_at').eq('token', token).single();
+    if (error || !authToken) return res.status(401).json({ error: 'Invalid token' });
+    if (authToken.used) return res.status(401).json({ error: 'Token already used' });
+    if (new Date(authToken.expires_at) < new Date()) return res.status(401).json({ error: 'Token expired' });
+    return res.json({ valid: true });
+  } catch (err) { console.error('[API] verify-check error:', err.message); res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/auth/verify', async (req, res) => {
+  // POST consumes token — triggered by user tap only
+  try {
+    const { token } = req.body;
     if (!token) return res.status(400).json({ error: 'Token required' });
     const { data: authToken, error } = await supabase.from('auth_tokens').select('*, user:users(id, email, stripe_default_pm)').eq('token', token).single();
     if (error || !authToken) return res.status(401).json({ error: 'Invalid token' });

@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate, useParams, useLocation } from 'react-router-dom';
+import { useNavigate, useParams } from 'react-router-dom';
 import { loadStripe } from '@stripe/stripe-js';
 import { Elements, CardElement, useStripe, useElements } from '@stripe/react-stripe-js';
 import Logo from '../components/Logo';
@@ -45,7 +45,7 @@ function StartForm() {
     }
   }, []);
 
-  // Check email on blur — if returning user, switch to returning mode
+  // Check email on blur — if returning user, switch to returning mode only (do NOT auto-send magic link)
   const handleEmailBlur = async () => {
     if (!email || !email.includes('@') || mode === 'returning') return;
     try {
@@ -55,7 +55,9 @@ function StartForm() {
         body: JSON.stringify({ email, chargePointId }),
       });
       const data = await res.json();
-      if (data.returning) await handleSendMagicLink();
+      if (data.returning) {
+        setMode('returning');
+      }
     } catch {}
   };
 
@@ -96,17 +98,14 @@ function StartForm() {
       if (!res.ok) {
         if (res.status === 401) {
           localStorage.removeItem('evflo_jwt');
-          localStorage.removeItem('evflo_email');
-          localStorage.removeItem('evflo_last4');
-          setMode('guest');
-          setError('Your session has expired. Please enter your card details again.');
+          // JWT expired — auto send magic link to re-authenticate seamlessly
+          await handleSendMagicLink();
         } else {
           setError(data.error || 'Failed to start session');
+          setLoading(false);
         }
-        setLoading(false);
         return;
       }
-      // Free charging branch
       if (data.freeCharge) {
         navigate(`/session/${chargePointId}`, {
           state: { sessionId: data.sessionId, email, ratePerKwh: data.ratePerKwh, freeCharge: true },
@@ -129,7 +128,6 @@ function StartForm() {
     setError('');
     setLoading(true);
     try {
-      // Create PaymentIntent
       const piRes = await fetch(`${API}/api/sessions/create-payment-intent`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -138,14 +136,12 @@ function StartForm() {
       const piData = await piRes.json();
       if (!piRes.ok) { setError(piData.error || 'Failed to initialise payment'); setLoading(false); return; }
 
-      // Confirm card
       const { error: stripeError, paymentIntent } = await stripe.confirmCardPayment(piData.clientSecret, {
         payment_method: { card: elements.getElement(CardElement), billing_details: { email } },
       });
       if (stripeError) { setError(stripeError.message || 'Card authorisation failed'); setLoading(false); return; }
       if (paymentIntent.status !== 'requires_capture') { setError('Card not authorised. Please try again.'); setLoading(false); return; }
 
-      // Start session
       const sessionRes = await fetch(`${API}/api/sessions/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -163,7 +159,7 @@ function StartForm() {
     }
   };
 
-  // ── RETURNING USER SCREEN ──────────────────────────────────────────────────
+  // —— RETURNING USER SCREEN ——————————————————————————————————————
   if (mode === 'returning') {
     return (
       <div className="screen">
@@ -194,12 +190,16 @@ function StartForm() {
             <button className="btn-primary" onClick={handleReturningStart} disabled={loading}>
               {loading ? 'Starting...' : 'Begin Charging ›'}
             </button>
+            <button className="btn-secondary" onClick={handleSendMagicLink} disabled={loading}>
+              {loading ? 'Sending...' : 'Send magic link instead'}
+            </button>
             <button className="btn-secondary" onClick={() => {
               localStorage.removeItem('evflo_jwt');
               localStorage.removeItem('evflo_email');
               localStorage.removeItem('evflo_last4');
               setMode('guest');
               setEmail('');
+              setError('');
             }}>
               Use a different card
             </button>
@@ -209,7 +209,7 @@ function StartForm() {
     );
   }
 
-  // ── MAGIC LINK SENT SCREEN ─────────────────────────────────────────────────
+  // —— MAGIC LINK SENT SCREEN ————————————————————————————————————
   if (mode === 'magic_link_sent') {
     return (
       <div className="screen">
@@ -239,7 +239,7 @@ function StartForm() {
     );
   }
 
-  // ── GUEST SCREEN (default) ─────────────────────────────────────────────────
+  // —— GUEST SCREEN (default) ————————————————————————————————————
   return (
     <div className="screen">
       <div className="screen-inner">
